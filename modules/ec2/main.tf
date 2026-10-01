@@ -85,8 +85,10 @@ resource "aws_security_group" "app" {
 
 # ---------------- IAM: ECR에서 이미지 읽기만 ----------------
 
+# 이름에 deploy_id를 넣어(pawploy-<deploy_id>-xxxx) 콘솔에서 어느 배포의 역할인지 바로 알 수 있게 한다.
+# IAM 이름 제한 64자: "pawploy-" 8 + deploy_id 최대 40 + "-" + 접미사 26 = 75 가 되므로 name_prefix 는 38자로 자른다.
 resource "aws_iam_role" "app" {
-  name_prefix = "pawploy-ec2-"
+  name_prefix = "${substr(var.name, 0, 38)}-"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -103,7 +105,7 @@ resource "aws_iam_role_policy_attachment" "ecr_read" {
 }
 
 resource "aws_iam_instance_profile" "app" {
-  name_prefix = "pawploy-ec2-"
+  name_prefix = "${substr(var.name, 0, 38)}-"
   role        = aws_iam_role.app.name
 }
 
