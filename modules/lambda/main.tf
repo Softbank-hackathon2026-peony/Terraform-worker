@@ -68,13 +68,25 @@ resource "aws_lambda_function_url" "app" {
   authorization_type = "NONE"
 }
 
-# 인증 없는 함수 URL을 API/Terraform으로 만들 때는 공개 호출 권한을 따로 추가해야 함
+# 인증 없는 함수 URL을 API/Terraform으로 만들 때는 공개 호출 권한을 따로 추가해야 함.
+# 2025-10부터 새 함수 URL은 lambda:InvokeFunctionUrl 과 lambda:InvokeFunction 둘 다 있어야 하며,
+# 하나라도 빠지면 auth type이 NONE이어도 403 Forbidden이 난다.
+# (https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html)
 resource "aws_lambda_permission" "public_url" {
   statement_id           = "AllowPublicFunctionUrl"
   action                 = "lambda:InvokeFunctionUrl"
   function_name          = aws_lambda_function.app.function_name
   principal              = "*"
   function_url_auth_type = "NONE"
+}
+
+# invoked_via_function_url 조건으로 "함수 URL을 통해서만" 호출을 허용한다 (직접 Invoke API는 막힘)
+resource "aws_lambda_permission" "public_invoke" {
+  statement_id             = "AllowPublicInvokeViaFunctionUrl"
+  action                   = "lambda:InvokeFunction"
+  function_name            = aws_lambda_function.app.function_name
+  principal                = "*"
+  invoked_via_function_url = true
 }
 
 output "endpoint" {

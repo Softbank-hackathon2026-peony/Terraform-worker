@@ -14,6 +14,7 @@
   실패·응답 없음이면 diagnose.py가 진단 자료를 모으고 AgentCore 진단 에이전트를 부른다.
 """
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -22,6 +23,13 @@ from . import artifacts, awscli, diagnose, health, image, recommendation
 from . import job as jobmod, render, terraform as tf
 
 HEALTH_TIMEOUT = {"ec2": 420, "lambda": 180}   # EC2는 부팅 + Docker 설치 시간이 필요
+
+
+def _health_params(architecture: str) -> tuple[int, int]:
+    """헬스체크 (최대 대기 초, 재시도 간격 초). 테스트에서는 환경변수로 짧게 줄인다."""
+    timeout = int(os.environ.get("PAWPLOY_HEALTH_TIMEOUT") or HEALTH_TIMEOUT[architecture])
+    interval = int(os.environ.get("PAWPLOY_HEALTH_INTERVAL") or 10)
+    return timeout, interval
 
 
 def write_result(job: dict, **fields) -> dict:
@@ -42,6 +50,7 @@ def deploy(job_path: str) -> int:
         if raw.get("recommendation_uri"):
             raw = recommendation.merge(raw, recommendation.load(raw["recommendation_uri"]))
         job = jobmod.validate(raw)
+        render.check_not_active(job["deploy_id"])   # 살아 있는 배포 위에 덮어쓰지 않는다
     except (ValueError, OSError, awscli.AwsError) as e:
         print(f"[worker] 입력 오류: {e}")
         return 2
@@ -91,7 +100,8 @@ def deploy(job_path: str) -> int:
     write_result(job, status="health_check", endpoint=endpoint, health_url=health_url,
                  resource_id=out["resource_id"]["value"])
 
-    ok = health.wait_healthy(health_url, timeout=HEALTH_TIMEOUT[job["architecture"]])
+    timeout, interval = _health_params(job["architecture"])
+    ok = health.wait_healthy(health_url, timeout=timeout, interval=interval)
     result = write_result(job, status="running" if ok else "unhealthy",
                           deploy_seconds=int(time.time() - started))
     if not ok:

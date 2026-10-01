@@ -48,8 +48,8 @@ Pawploy 전체 흐름에서 ⑦ 배포를 맡습니다.
 
 | 도구 | 확인 명령 |
 |---|---|
-| Python 3.10 이상 | `py --version` |
-| Terraform 1.5 이상 | `terraform -version` |
+| Python 3.10 이상 | `py --version` (macOS 기본 python3 는 3.9 라 Homebrew python3.11 등을 쓸 것) |
+| Terraform 1.10 이상 | `terraform -version` (S3 state 잠금 `use_lockfile` 이 1.10 부터) |
 | AWS CLI v2 + 로그인 | `aws sts get-caller-identity` |
 
 ## 사용법
@@ -67,7 +67,24 @@ python -m tfworker destroy dep-demo-ec2            # 삭제
 ### 비용 없이 흐름만 시험하기
 
 `PAWPLOY_OFFLINE=1`은 AWS를 부르는 단계(이미지 확인, S3 보관, 로그 수집)를 건너뜁니다.
-`TERRAFORM_BIN`에 가짜 terraform을 지정하면 실제 리소스 없이 deploy → 헬스체크 → destroy 흐름을 확인할 수 있습니다.
+`TERRAFORM_BIN`에 가짜 terraform(`tools/fake-terraform.py`)을 지정하면 실제 리소스 없이 deploy → 헬스체크 → destroy 흐름을 확인할 수 있습니다.
+
+```bash
+# 자동 테스트 (정상 / apply 실패 → 자동 정리 / 응답 없음 / 입력 오류 / 재배포 거부 / state 없는 destroy 거부 / 추천 결과 병합)
+python -m unittest -v
+
+# 손으로 한 번 돌려 보기 (헬스체크는 127.0.0.1:9 로 가서 몇 초 뒤 unhealthy 로 끝남)
+PAWPLOY_OFFLINE=1 TERRAFORM_BIN=tools/fake-terraform.py PAWPLOY_HEALTH_TIMEOUT=5 PAWPLOY_HEALTH_INTERVAL=1 \
+  python -m tfworker deploy examples/job-ec2.json
+```
+
+가짜 terraform 은 `FAKE_TF_FAIL=apply` 처럼 실패시킬 단계를, `FAKE_TF_ENDPOINT` 로 헬스체크 대상 주소를 바꿀 수 있습니다.
+
+실제 terraform 으로 문법만 검사하려면 (provider 다운로드만 하고 AWS 는 부르지 않음):
+
+```bash
+terraform -chdir=work/<deploy_id> init -backend=false && terraform -chdir=work/<deploy_id> validate
+```
 
 ---
 
@@ -91,7 +108,7 @@ python -m tfworker destroy dep-demo-ec2            # 삭제
 
 | 필드 | 필수 | 설명 |
 |---|---|---|
-| `deploy_id` | ✅ | 소문자·숫자·하이픈 4~40자. AWS 리소스 이름 `pawploy-<deploy_id>`에 쓰임 |
+| `deploy_id` | ✅ | 소문자·숫자·하이픈 4~40자. AWS 리소스 이름 `pawploy-<deploy_id>`에 쓰임. **배포마다 새 값**을 써야 하며, 살아 있는 배포(`destroyed`/`failed`가 아닌 상태)와 같은 id 는 거부됨(종료 코드 2) |
 | `project_id` | ✅ | 태그와 state 경로에 쓰임 |
 | `image_uri` | ✅ | ECR 주소. 워커가 digest로 고정함 |
 | `recommendation_uri` | | AgentCore 추천 결과 위치. 있으면 아래 필드의 기본값으로 쓰임 |
@@ -177,12 +194,13 @@ destroying → destroyed  /  destroy_failed
 
 | 이름 | 설명 |
 |---|---|
-| `PAWPLOY_STATE_BUCKET` | 지정하면 state를 S3에 저장 (`deployments/<project_id>/<deploy_id>.tfstate`). 없으면 작업 폴더에 로컬 저장 |
+| `PAWPLOY_STATE_BUCKET` | 지정하면 state를 S3에 저장 (`deployments/<project_id>/<deploy_id>.tfstate`, S3 네이티브 잠금 `use_lockfile=true`). 없으면 작업 폴더에 로컬 저장 |
 | `PAWPLOY_STATE_REGION` | state 버킷 리전 (기본: 배포 리전) |
 | `PAWPLOY_ARTIFACT_BUCKET` | 지정하면 작업 폴더를 `workdirs/<deploy_id>/`에 보관. 로컬에 없으면 destroy 때 여기서 받음 |
 | `PAWPLOY_DIAGNOSE_AGENT_ARN` | AgentCore 진단 에이전트 Runtime ARN. 없으면 진단 자료만 저장 |
 | `PAWPLOY_WORK_DIR` | 작업 폴더 위치 (기본 `./work`) |
 | `PAWPLOY_OFFLINE` | `1`이면 AWS 호출 단계를 건너뜀 (시험용) |
+| `PAWPLOY_HEALTH_TIMEOUT`, `PAWPLOY_HEALTH_INTERVAL` | 헬스체크 최대 대기·재시도 간격(초). 기본 EC2 420 / Lambda 180, 간격 10. 테스트에서 짧게 줄일 때만 사용 |
 | `TERRAFORM_BIN`, `AWS_BIN` | 실행 파일 경로 |
 
 **다른 머신·컨테이너에서 destroy하려면** `PAWPLOY_STATE_BUCKET`과 `PAWPLOY_ARTIFACT_BUCKET`이 둘 다 필요합니다.
@@ -196,8 +214,10 @@ state를 찾을 수 없으면 워커가 destroy를 거부하고 `destroy_failed`
 tfworker/          워커 (위 표 참고) + awscli.py(aws CLI 실행 도우미)
 modules/
   ec2/             Amazon Linux 2023 + Docker. 기본 VPC, 80번 포트만 개방, ECR 읽기 권한만
-  lambda/          이미지 Lambda + 인증 없는 함수 URL, 로그 쓰기 권한만
-examples/          작업 입력·추천 결과 예시, 테스트용 sample-app
+  lambda/          이미지 Lambda + 인증 없는 함수 URL(InvokeFunctionUrl + InvokeFunction 두 권한), 로그 쓰기 권한만
+examples/          작업 입력·추천 결과 예시, 테스트용 sample-app (Lambda Web Adapter 1.1.0)
+tools/             fake-terraform.py (비용 없는 흐름 시험용)
+tests/             unittest (python -m unittest -v)
 work/<deploy_id>/  배포마다 생기는 작업 폴더 (git 제외)
 ```
 
@@ -210,8 +230,8 @@ work/<deploy_id>/  배포마다 생기는 작업 폴더 (git 제외)
 
 | 항목 | 상태 |
 |---|---|
-| 가짜 terraform으로 정상 / apply 실패 / 응답 없음 / 입력 오류 / state 없는 destroy 경로 | ✅ |
-| 실제 terraform `validate` (EC2, Lambda 모듈, AWS provider 5.100.0) | ✅ |
+| 가짜 terraform으로 정상 / apply 실패 / 응답 없음 / 입력 오류 / 재배포 거부 / state 없는 destroy / 추천 병합 경로 (`tests/`) | ✅ |
+| 실제 terraform `validate` (EC2, Lambda 모듈) | ✅ (2026-10-02, Terraform 1.16.4 + AWS provider 6.67.0) |
 | 실제 AWS 배포 (EC2, Lambda) | ❌ 아직 |
 | ECR digest 고정, S3 보관·복원, 진단 로그 수집 | ❌ 실제 AWS로 아직 안 해 봄 |
 | AgentCore 진단 에이전트 호출 (`aws bedrock-agentcore invoke-agent-runtime`) | ❌ 에이전트가 아직 없음 |

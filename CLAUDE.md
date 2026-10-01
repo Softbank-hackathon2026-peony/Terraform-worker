@@ -110,8 +110,16 @@ modules/
   lambda/         이미지 패키지 Lambda + 인증 없는 함수 URL, 로그 쓰기 권한만
 examples/
   job-ec2.json, job-lambda.json   작업 입력 예시 (image_uri는 실제 값으로 바꿔야 함)
-  sample-app/                     테스트용 이미지 (Python 웹앱 + Lambda Web Adapter, EC2·Lambda 겸용)
+  sample-app/                     테스트용 이미지 (Python 웹앱 + Lambda Web Adapter 1.1.0, EC2·Lambda 겸용)
+tools/
+  fake-terraform.py  가짜 terraform (FAKE_TF_FAIL, FAKE_TF_ENDPOINT 로 실패·헬스체크 대상 조절)
+tests/
+  test_worker.py     unittest 9개. `python -m unittest -v` (비용 없음, 10초 내외)
 ```
+
+- 같은 `deploy_id`로 살아 있는 배포가 있으면 deploy를 거부한다(`render.check_not_active`, 종료 코드 2). `destroyed`/`failed`면 재사용 가능
+- 헬스체크 시간은 `PAWPLOY_HEALTH_TIMEOUT` / `PAWPLOY_HEALTH_INTERVAL`로 줄일 수 있다(테스트용)
+- S3 backend는 `use_lockfile=true`로 잠금 → Terraform **1.10 이상** 필요 (루트 main.tf의 required_version)
 
 ### 실행 방법
 
@@ -127,19 +135,21 @@ python -m tfworker destroy dep-demo-ec2
 
 ### ⚠️ 검증 상태
 
-- 로컬 환경: Terraform 1.16, AWS CLI v2, Python 3.14 (`python` 대신 `py` 명령 사용)
-- 확인된 것 (2026-10-01): 가짜 terraform + `PAWPLOY_OFFLINE=1`로 정상 / apply 실패(진단 → 자동 정리) / unhealthy(진단) / 입력 오류 / state 없는 destroy 거부 경로. 실제 terraform `validate` 통과 (EC2·Lambda, AWS provider 5.100.0)
-- **아직 확인 안 된 것**: 실제 AWS 배포, ECR digest 고정, S3 보관·복원, 진단 로그 수집, AgentCore 진단 호출
-- 먼저 의심해 볼 지점
-  - `modules/ec2`: 기본 VPC 존재 여부
-  - `modules/lambda`: 인증 없는 함수 URL이 403을 돌려주면, AWS의 최근 정책 변경으로 `lambda:InvokeFunction` 권한(함수 URL 경유 조건)이 추가로 필요한지 공식 문서 확인
-  - `sample-app/Dockerfile`: Lambda Web Adapter 이미지 버전(`0.8.4`)이 존재하는지, 최신 버전 확인
+- 로컬 환경: Windows는 Terraform 1.16, AWS CLI v2, Python 3.14 (`python` 대신 `py`). Mac은 Terraform 1.16.4(Homebrew hashicorp/tap), Python은 `/opt/homebrew/bin/python3.11` (시스템 python3 3.9는 `str | None` 문법 때문에 안 됨), aws CLI·Docker 미설치
+- 확인된 것 (2026-10-02): `tests/` 9개 통과 (정상 / apply 실패 → 자동 정리 / unhealthy / 입력 오류 5종 / 재배포 거부 / state 없는 destroy 거부 / 추천 병합). 실제 terraform `validate` 통과 (EC2·Lambda, Terraform 1.16.4 + AWS provider 6.67.0)
+- **아직 확인 안 된 것**: 실제 AWS 배포, ECR digest 고정, S3 보관·복원·잠금, 진단 로그 수집, AgentCore 진단 호출
+- 해결된 의심 지점 (2026-10-02, 공식 문서 확인)
+  - `modules/lambda`: 2025-10부터 인증 없는 함수 URL은 `lambda:InvokeFunctionUrl` + `lambda:InvokeFunction`(`invoked_via_function_url`) 둘 다 필요 → 두 번째 권한 추가함
+  - `sample-app/Dockerfile`: Web Adapter `0.8.4`는 존재하지만 구버전 → 공식 README 권장 `1.1.0`으로 올림
+- 아직 남은 의심 지점
+  - `modules/ec2`: 팀 계정 서울 리전에 기본 VPC가 있는지 (`aws ec2 describe-vpcs --filters Name=isDefault,Values=true`)
+  - EC2 콘솔 출력은 부팅 몇 분 뒤에야 채워지므로 진단 로그가 비어 있을 수 있음
 
 ---
 
 ## 4. 다음 할 일 (순서대로)
 
-1. [ ] terraform(1.5 이상)과 AWS CLI 설치·로그인 확인 (`terraform -version`, `aws sts get-caller-identity`)
+1. [ ] terraform(1.10 이상, AWS provider 6.28 이상 자동 설치)과 AWS CLI 설치·로그인 확인 (`terraform -version`, `aws sts get-caller-identity`)
 2. [ ] 샘플 이미지를 **linux/amd64**로 빌드해서 ECR에 푸시 (팀 계정, 서울 리전)
 3. [ ] `examples/job-ec2.json`의 `image_uri`를 실제 값으로 바꾸고, 작업 폴더에서 `terraform validate`·`plan`으로 오류 수정
 4. [ ] **사용자 확인 후** EC2 실제 배포 → 접속 확인 → destroy (한 바퀴 성공이 최우선)
