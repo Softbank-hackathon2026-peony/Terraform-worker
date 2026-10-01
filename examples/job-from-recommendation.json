@@ -1,0 +1,6 @@
+{
+  "deploy_id": "dep-demo-rec",
+  "project_id": "prj_demo",
+  "image_uri": "123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/pawploy-sample:latest",
+  "recommendation_uri": "examples/recommendation-ec2.json"
+}

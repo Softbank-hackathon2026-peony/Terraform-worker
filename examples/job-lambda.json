@@ -1,0 +1,12 @@
+{
+  "deploy_id": "dep-demo-lambda",
+  "project_id": "prj_demo",
+  "architecture": "lambda",
+  "image_uri": "123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/pawploy-sample:latest",
+  "container_port": 8080,
+  "size": "small",
+  "health_path": "/",
+  "env": {
+    "APP_MODE": "test"
+  }
+}

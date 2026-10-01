@@ -1,0 +1,49 @@
+#!/bin/bash
+# EC2 첫 부팅 때 실행. 로그: /var/log/pawploy-bootstrap.log
+set -euo pipefail
+exec > >(tee -a /var/log/pawploy-bootstrap.log) 2>&1
+echo "[pawploy] start $(date -Is)"
+
+dnf install -y docker
+systemctl enable --now docker
+
+%{ if ecr_region != "" ~}
+for i in 1 2 3 4 5; do
+  if aws ecr get-login-password --region "${ecr_region}" \
+      | docker login --username AWS --password-stdin "${registry}"; then
+    break
+  fi
+  echo "[pawploy] ecr login retry $i"
+  sleep 5
+done
+%{ endif ~}
+
+for i in 1 2 3 4 5 6; do
+  if docker pull "${image_uri}"; then
+    break
+  fi
+  if [ "$i" -eq 6 ]; then
+    echo "[pawploy] ERROR: pull failed"
+    exit 1
+  fi
+  echo "[pawploy] pull retry $i"
+  sleep 10
+done
+
+mkdir -p /etc/pawploy
+cat > /etc/pawploy/app.env <<'ENVEOF'
+PORT=${container_port}
+%{ for k, v in env ~}
+${k}=${v}
+%{ endfor ~}
+ENVEOF
+chmod 600 /etc/pawploy/app.env
+
+docker rm -f app >/dev/null 2>&1 || true
+docker run -d --name app --restart unless-stopped \
+  --env-file /etc/pawploy/app.env \
+  -p 80:${container_port} \
+  --log-opt max-size=10m --log-opt max-file=3 \
+  "${image_uri}"
+
+echo "[pawploy] done $(date -Is)"

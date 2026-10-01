@@ -1,0 +1,10 @@
+{
+  "architecture": "ec2",
+  "container_port": 8080,
+  "size": "small",
+  "health_path": "/",
+  "env": {
+    "APP_MODE": "test"
+  },
+  "reason": "상시 실행되는 웹 서버라서 EC2가 적합합니다 (예시 값)"
+}
