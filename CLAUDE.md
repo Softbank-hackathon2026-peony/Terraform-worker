@@ -93,15 +93,19 @@ claude.ai에서 나눈 설계 대화를 정리한 컨텍스트입니다. 작업 
 
 ```
 tfworker/
-  __main__.py        진입점: deploy / destroy / status
+  __main__.py        진입점: deploy / destroy / status / sweep / orphans
   recommendation.py  ② AgentCore 추천 결과(recommendation_uri, S3 또는 로컬) 읽어 작업 입력에 합침
-  job.py             입력 검증 (허용 아키텍처·크기, ECR 주소 형식, 환경변수 이름, TTL 최대 60분)
+  job.py             입력 검증 (허용 아키텍처·크기, ECR 주소 형식, 환경변수 이름, TTL 최대 60분, Lambda 리전=이미지 리전)
   image.py           ① ECR에 이미지가 있는지 확인, 태그 → @sha256 digest 고정
   render.py          ③ work/<deploy_id>/ 생성: main.tf, terraform.tfvars.json, job.json, 모듈 복사
+                        (PAWPLOY_DESTROY_QUEUE_ARN + PAWPLOY_SCHEDULER_ROLE_ARN 있으면 만료 destroy 예약 블록 포함)
   artifacts.py       ④ 작업 폴더를 S3(PAWPLOY_ARTIFACT_BUCKET)에 보관, destroy 때 복원
   terraform.py       ⑤ terraform CLI 실행 (로그 실시간 출력)
+  policy.py          apply 직전 plan(show -json) 검사: 허용 리소스 종류·인스턴스 타입·Lambda 크기·인바운드 80만·필수 태그
   health.py          헬스체크 대기 (EC2 최대 420초, Lambda 최대 180초)
   diagnose.py        failed/unhealthy 시 로그 수집 → AgentCore 진단 에이전트 호출 (PAWPLOY_DIAGNOSE_AGENT_ARN)
+  store.py           result.json 과 같은 내용을 DynamoDB(PAWPLOY_STATUS_TABLE)에 기록. 실패해도 배포는 계속
+  expire.py          만료 정리: sweep(로컬+DynamoDB 에서 만료 배포 찾아 destroy), orphans(태그로 남은 리소스 알림)
   awscli.py          aws CLI 실행 도우미 (PAWPLOY_OFFLINE=1이면 AWS 호출 단계 건너뜀)
 modules/
   ec2/            Amazon Linux 2023 + Docker. 기본 VPC, 80번 포트만 개방(SSH 닫음), ECR 읽기 권한,
@@ -112,9 +116,11 @@ examples/
   job-ec2.json, job-lambda.json   작업 입력 예시 (image_uri는 실제 값으로 바꿔야 함)
   sample-app/                     테스트용 이미지 (Python 웹앱 + Lambda Web Adapter 1.1.0, EC2·Lambda 겸용)
 tools/
-  fake-terraform.py  가짜 terraform (FAKE_TF_FAIL, FAKE_TF_ENDPOINT 로 실패·헬스체크 대상 조절)
+  fake-terraform.py     가짜 terraform (FAKE_TF_FAIL, FAKE_TF_ENDPOINT, FAKE_TF_INSTANCE_TYPE, FAKE_TF_EXTRA_RESOURCE)
+  fake-aws.py           가짜 aws CLI (FAKE_AWS_LOG 에 호출 기록, ECR·DynamoDB·S3·태그 조회 응답 흉내)
+  push-sample-image.sh  샘플 이미지 linux/amd64 빌드 → ECR 푸시 (--provenance=false 필수, Lambda 가 이미지 인덱스를 거부)
 tests/
-  test_worker.py     unittest 9개. `python -m unittest -v` (비용 없음, 10초 내외)
+  test_worker.py     unittest 19개. `python -m unittest -v` (비용 없음, 10초 내외)
 ```
 
 - 같은 `deploy_id`로 살아 있는 배포가 있으면 deploy를 거부한다(`render.check_not_active`, 종료 코드 2). `destroyed`/`failed`면 재사용 가능
@@ -127,17 +133,20 @@ tests/
 python -m tfworker deploy examples/job-ec2.json
 python -m tfworker status dep-demo-ec2
 python -m tfworker destroy dep-demo-ec2
+python -m tfworker sweep --dry-run     # 만료된 배포 목록만 / --dry-run 빼면 destroy
+python -m tfworker orphans             # 태그로 만료 지난 리소스 목록 (삭제 안 함)
 ```
 
 - state는 기본적으로 작업 폴더에 로컬 저장. 환경변수 `PAWPLOY_STATE_BUCKET`을 지정하면 S3 backend 사용 (`deployments/<project_id>/<deploy_id>.tfstate`)
 - `PAWPLOY_WORK_DIR`로 작업 폴더 위치 변경 가능, `TERRAFORM_BIN`으로 terraform 경로 지정 가능
 - Python 표준 라이브러리만 사용 (추가 설치 없음)
+- apply 전(init·plan·정책) 실패는 리소스가 없으므로 destroy 없이 `failed` → 같은 deploy_id 재사용 가능. apply 중 실패만 자동 destroy
 
 ### ⚠️ 검증 상태
 
-- 로컬 환경: Windows는 Terraform 1.16, AWS CLI v2, Python 3.14 (`python` 대신 `py`). Mac은 Terraform 1.16.4(Homebrew hashicorp/tap), Python은 `/opt/homebrew/bin/python3.11` (시스템 python3 3.9는 `str | None` 문법 때문에 안 됨), aws CLI·Docker 미설치
-- 확인된 것 (2026-10-02): `tests/` 9개 통과 (정상 / apply 실패 → 자동 정리 / unhealthy / 입력 오류 5종 / 재배포 거부 / state 없는 destroy 거부 / 추천 병합). 실제 terraform `validate` 통과 (EC2·Lambda, Terraform 1.16.4 + AWS provider 6.67.0)
-- **아직 확인 안 된 것**: 실제 AWS 배포, ECR digest 고정, S3 보관·복원·잠금, 진단 로그 수집, AgentCore 진단 호출
+- 로컬 환경: Windows는 Terraform 1.16, AWS CLI v2, Python 3.14 (`python` 대신 `py`). Mac은 Terraform 1.16.4(Homebrew hashicorp/tap), Python은 `/opt/homebrew/bin/python3.12` (시스템 python3 3.9는 `str | None` 문법 때문에 안 됨), aws CLI·Docker 미설치
+- 확인된 것 (2026-10-02): `tests/` 19개 통과 (정상 / apply·init 실패 / unhealthy / 입력 오류 6종 / 정책 위반 2종 / 재배포 거부 / state 없는 destroy 거부 / 추천 병합 / ECR digest 고정 / S3 보관 제외 목록 / DynamoDB 기록 / sweep 로컬·DynamoDB / orphans / 스케줄러 렌더). 실제 terraform `validate`·`fmt` 통과 (EC2·Lambda·스케줄러 포함 루트, Terraform 1.16.4 + AWS provider 6.67.0)
+- **아직 확인 안 된 것**: 실제 AWS 배포, ECR digest 고정·S3 보관·DynamoDB 기록·태그 조회의 **실제 응답 형식**(가짜 aws 로 호출 인자만 검증함), EventBridge Scheduler 예약 실행, 진단 로그 수집, AgentCore 진단 호출
 - 해결된 의심 지점 (2026-10-02, 공식 문서 확인)
   - `modules/lambda`: 2025-10부터 인증 없는 함수 URL은 `lambda:InvokeFunctionUrl` + `lambda:InvokeFunction`(`invoked_via_function_url`) 둘 다 필요 → 두 번째 권한 추가함
   - `sample-app/Dockerfile`: Web Adapter `0.8.4`는 존재하지만 구버전 → 공식 README 권장 `1.1.0`으로 올림
@@ -150,16 +159,17 @@ python -m tfworker destroy dep-demo-ec2
 ## 4. 다음 할 일 (순서대로)
 
 1. [ ] terraform(1.10 이상, AWS provider 6.28 이상 자동 설치)과 AWS CLI 설치·로그인 확인 (`terraform -version`, `aws sts get-caller-identity`)
-2. [ ] 샘플 이미지를 **linux/amd64**로 빌드해서 ECR에 푸시 (팀 계정, 서울 리전)
+2. [ ] 샘플 이미지를 **linux/amd64**로 빌드해서 ECR에 푸시 (팀 계정, 서울 리전) → `tools/push-sample-image.sh` 한 번 실행
 3. [ ] `examples/job-ec2.json`의 `image_uri`를 실제 값으로 바꾸고, 작업 폴더에서 `terraform validate`·`plan`으로 오류 수정
 4. [ ] **사용자 확인 후** EC2 실제 배포 → 접속 확인 → destroy (한 바퀴 성공이 최우선)
 5. [ ] Lambda도 같은 방식으로 한 바퀴
-6. [ ] apply 실패 경로와 입력 오류 경로 테스트
-7. [ ] **1시간 자동 삭제**: 배포 성공 시 EventBridge Scheduler로 `expires_at`에 destroy 요청 예약 (`ActionAfterCompletion=DELETE`) + 5~10분마다 만료된 배포를 찾는 정기 점검 + `pawploy:expires_at` 태그로 남은 리소스 찾기(처음엔 알림만)
-8. [ ] 상태를 `result.json` 대신 **DynamoDB**에 기록 (Main Server가 읽도록)
-9. [ ] Main Server와 연결 방식 결정 (SQS로 받을지, CodeBuild/ECS 작업으로 실행할지). **Lambda에서 실행은 비추천** (15분 제한)
-10. [ ] ECS Fargate 모듈 추가 (공용 ALB를 미리 만들어 두고 배포마다 대상 그룹 + 리스너 규칙만 추가하는 방식 권장)
-11. [ ] plan 결과(`terraform show -json`) 정책 검사: 허용 리소스 종류, 인스턴스 타입, 필수 태그
+6. [x] apply 실패 경로와 입력 오류 경로 테스트 (가짜 terraform·aws 로. 실제 AWS 응답 형식은 4·5번에서 확인)
+7. [x] **1시간 자동 삭제** 코드: Scheduler 예약(`render.py`, 환경변수 있을 때) + `sweep` 정기 점검 + `orphans` 태그 알림 (`expire.py`)
+   - [ ] 팀 계정에 상태 테이블·destroy 큐·Scheduler 역할 만들기 (README "1시간 자동 삭제" 의 명령) + `sweep` 을 5~10분 주기로 돌릴 자리 정하기
+8. [x] 상태를 **DynamoDB**에도 기록 (`store.py`, `PAWPLOY_STATUS_TABLE`). `result.json` 은 로컬 기록으로 유지
+9. [ ] Main Server와 연결 방식 결정 (SQS로 받을지, CodeBuild/ECS 작업으로 실행할지). **Lambda에서 실행은 비추천** (15분 제한). destroy 큐 소비자도 여기서 함께
+10. [ ] ECS Fargate 모듈 추가 (공용 ALB를 미리 만들어 두고 배포마다 대상 그룹 + 리스너 규칙만 추가하는 방식 권장). 추가 시 `policy.ALLOWED_TYPES` 에도 등록
+11. [x] plan 결과(`terraform show -json`) 정책 검사 (`policy.py`): 허용 리소스 종류, 인스턴스 타입, Lambda 메모리·타임아웃, 인바운드 80만, 필수 태그
 
 ---
 
