@@ -309,7 +309,7 @@ work/<deploy_id>/  배포마다 생기는 작업 폴더 (git 제외): result.jso
 |---|---|
 | 가짜 terraform·aws 로 32개 경로 (+ 입력 오류 기록, DynamoDB 잠금·결과 이어받기, 만료 큐 처리): 단일·멀티 클라우드, 한쪽 실패 후 그쪽만 재시도, 단계별 실패 보고·정리, AgentCore 모듈 사용·IaC 거부·정책 거부, 입력 오류, sweep·orphans 등 | ✅ |
 | 실제 terraform `validate` (EC2·Lambda·Cloud Run 루트+모듈) + `fmt` | ✅ (AWS provider 6.67, Google provider 6.50) |
-| 실제 AWS EC2 한 바퀴 (배포 → 접속 → 삭제) | ✅ 2026-10-02 (`targets` 구조로 바뀌기 전 코드) |
+| 실제 AWS EC2 한 바퀴 (배포 → 접속 → 삭제) | ✅ 2026-10-02 (`targets` 구조로 재확인: 헬스체크 121초, 삭제 후 남은 리소스 없음) |
 | 실제 GCP Cloud Run 한 바퀴 (배포 → 접속 → 삭제) | ✅ 2026-10-02 (`softbankhackathon2026-peony`, 첫 시도 403 → 실패 보고·정리 → 권한 추가 후 같은 deploy_id 재시도 성공) |
 | 실제 AWS·GCP 동시 배포, S3·DynamoDB·Scheduler 실제 호출 | ❌ |
 

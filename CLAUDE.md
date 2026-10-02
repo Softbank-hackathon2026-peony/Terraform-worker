@@ -151,9 +151,10 @@ python -m tfworker orphans
   - `tests/` 27개 통과: 단일·멀티 클라우드, GCP 단독, 한쪽 실패 후 그쪽만 재시도·만료 시각 유지, 단계별 실패 보고(apply·init·plan·health_check)·정리, AgentCore 모듈 사용·IaC 거부·정책 거부, 입력 오류 11종, 클라우드 하나만 destroy, state 없는 destroy 거부, sweep·orphans, digest 고정·DynamoDB 기록
   - 실제 terraform `validate`·`fmt` 통과: EC2·Lambda·Cloud Run (AWS provider 6.67, Google provider 6.50, deploy_id 40자)
   - 실제 terraform `plan` 으로 새 AWS 정책 검사(IAM 정책 허용 목록·크레딧) 통과 확인
-  - **실제 AWS EC2 한 바퀴 성공** (`dep-demo-ec2b`, 249초) — 단, `targets` 구조로 바꾸기 전 코드
+  - **실제 AWS EC2 한 바퀴 성공** (`dep-demo-ec2b`, 249초) — `targets` 구조로 바꾸기 전 코드
+  - **바뀐 구조(targets)로 EC2 한 바퀴 재확인 성공** (`dep-demo-ec2c`): ECR 태그 → digest 고정 → IaC 검사 → plan 정책 검사(5개) → apply → 헬스체크 200(121초) → 접속 확인 → destroy(5개), 남은 EC2·IAM 역할 없음
   - **실제 GCP Cloud Run 한 바퀴 성공** (`dep-demo-gcp`, 프로젝트 `softbankhackathon2026-peony`, 서울 리전 저장소 `pawploy`): 실제 plan JSON 으로 정책 검사 필드(`terraform_labels`·`template[].scaling`·`deletion_protection`) 확인 → 첫 apply 403 → 실패 보고·정리(`current_state: []`) → 권한 추가 후 같은 deploy_id 재시도 → `running`(헬스체크 200) → 앱 전용 계정 `pp-dep-demo-gcp` 로 실행 확인 → destroy 후 남은 리소스 없음
-- **아직 확인 안 된 것**: 바뀐 구조로 EC2 재확인, Lambda 실제 배포, AWS+GCP 동시 실제 배포, S3·DynamoDB·Scheduler 실제 호출
+- **아직 확인 안 된 것**: Lambda 실제 배포, AWS+GCP 동시 실제 배포, S3·DynamoDB·Scheduler 실제 호출
 - 해결된 의심 지점
   - `modules/lambda`: 인증 없는 함수 URL은 `lambda:InvokeFunctionUrl` + `lambda:InvokeFunction`(`invoked_via_function_url`) 둘 다 필요
   - `modules/ec2` 기본 VPC: 인터넷 게이트웨이가 지워져 경로가 `blackhole`이었음 → `default-vpc-igw` 연결로 해결. EC2 헬스체크가 `URLError`만 반복하면 이것부터 확인
@@ -168,7 +169,7 @@ python -m tfworker orphans
 ## 4. 다음 할 일 (순서대로)
 
 1. [x] terraform·AWS CLI 설치·로그인, 샘플 이미지 ECR 푸시, EC2 한 바퀴 (2026-10-02)
-2. [ ] **바뀐 구조(targets)로 EC2 한 바퀴 재확인** ← 다음 최우선
+2. [x] 바뀐 구조(targets)로 EC2 한 바퀴 재확인 (2026-10-02)
 3. [x] GCP 서비스 계정 키 준비 → 샘플 이미지 Artifact Registry 푸시 → Cloud Run 한 바퀴 (2026-10-02)
 4. [ ] AWS + GCP 동시 한 바퀴, Lambda 한 바퀴 (Lambda 전에 Web Adapter 1.1.0 으로 이미지 다시 빌드)
 5. [ ] AgentCore 담당과 모듈 약속(README "AgentCore 가 만들 Terraform 모듈") 확정, S3 경로 규칙 정하기
