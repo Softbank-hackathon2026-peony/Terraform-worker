@@ -80,7 +80,8 @@ class WorkerFlowTest(unittest.TestCase):
 
     def run_worker(self, *args, **env):
         p = subprocess.run([sys.executable, "-m", "tfworker", *args], cwd=ROOT,
-                           env={**self.base_env, **env}, capture_output=True, text=True, encoding="utf-8")
+                           env={**self.base_env, "PYTHONIOENCODING": "utf-8", **env}, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
         return p.returncode, p.stdout + p.stderr
 
     def write_job(self, name="job.json", **overrides) -> str:
@@ -768,6 +769,24 @@ locals {
         self.assertEqual(code, 0, out)
         self.assertEqual(self.result("dep-by-queue")["status"], "destroyed", "만료 큐로 삭제")
         self.assertEqual(self.result("dep-by-sweep")["status"], "destroyed", "sweep 으로 삭제")
+
+    def test_consume_processes_deploy_destroy_and_bad_messages(self):
+        job = json.loads(Path(self.write_job(deploy_id="dep-from-queue")).read_text(encoding="utf-8"))
+        env = self.aws_env(FAKE_AWS_S3_BODY=json.dumps(job), PAWPLOY_MAINTENANCE_INTERVAL_SEC="3600")
+        self.aws_sqs.write_text(json.dumps([
+            json.dumps({"action": "deploy", "job_uri": "s3://bkt/jobs/dep-from-queue/1.json"}),
+            json.dumps({"action": "destroy", "deploy_id": "dep-from-queue"}),
+            json.dumps({"action": "reboot-everything"}),
+        ]), encoding="utf-8")
+
+        code, out = self.run_worker("consume", "https://sqs.ap-northeast-2.amazonaws.com/123456789012/pawploy-jobs.fifo",
+                                    "--once", **env)
+        self.assertEqual(code, 0, out)
+        self.assertIn("▶ deploy s3://bkt/jobs/dep-from-queue/1.json", out)
+        self.assertIn("잘못된 메시지 → 삭제", out)
+        self.assertEqual(self.result("dep-from-queue")["status"], "destroyed", "배포 뒤 같은 배포 삭제까지 순서대로")
+        self.assertEqual(len(self.aws_calls("sqs", "delete-message")), 3, "처리한 메시지·잘못된 메시지 모두 삭제")
+        self.assertIn("ap-northeast-2", self.aws_calls("sqs", "receive-message")[0], "리전은 큐 주소에서")
 
     def test_dynamodb_attr_roundtrip(self):
         sys.path.insert(0, str(ROOT))

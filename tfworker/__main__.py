@@ -7,6 +7,7 @@
   python -m tfworker orphans [region]                # 태그로 만료 지난 AWS 리소스 찾기 (알림만, 있으면 exit 1)
   python -m tfworker drain-destroy-queue [queue_url]  # 만료 예약(SQS) 메시지를 모두 받아 destroy (정기 실행용)
   python -m tfworker maintenance                     # 정기 실행 한 번에: 만료 큐 처리 + sweep (5~10분마다)
+  python -m tfworker consume [queue_url] [--once]     # SQS 작업 큐 소비자 (ECS Fargate 서비스로 상시 실행, consume.py)
 
 Terraform 은 AgentCore 가 만들어 S3 에 둔다(18~19단계). 워커는 사용자가 승인한 클라우드(target)마다
 AI 없이 항상 같은 순서로 검증하고 실행한다.
@@ -485,6 +486,9 @@ def main(argv: list[str]) -> int:
     cmd, args = (argv[0] if argv else None), argv[1:]
     if cmd == "sweep" and not set(args) - {"--dry-run"}:
         return sweep("--dry-run" in args)
+    if cmd == "consume" and len(args) <= 2:
+        from . import consume
+        return consume.main(args)
     if cmd == "maintenance" and not args:
         return maintenance()
     if cmd == "drain-destroy-queue" and len(args) <= 1:

@@ -8,7 +8,7 @@
 #   S3 버킷       pawploy-tf-<계정>-<리전>   state(deployments/)·작업 폴더 보관(workdirs/). 비공개·암호화·버전 관리
 #   DynamoDB 테이블 pawploy-deployments      배포 결과(Main Server 가 읽음) + 배포 잠금. 온디맨드
 #   SQS 큐        pawploy-destroy            만료 시각 destroy 예약 메시지
-#   IAM 역할      pawploy-scheduler          EventBridge Scheduler 가 그 큐에만 메시지를 보낼 수 있는 역할
+#   IAM 역할      ppw-scheduler              EventBridge Scheduler 가 그 큐에만 메시지를 보낼 수 있는 역할
 #
 # 워커 실행 역할(최소 권한)과 GCP 키 보관(Secrets Manager)은 실행 방식(SQS 소비 / ECS 작업 등)이 정해진 뒤 만든다.
 # (역할을 누가 맡을지 = 신뢰 정책이 실행 방식에 따라 달라지기 때문)
@@ -19,7 +19,7 @@ ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 BUCKET=${PAWPLOY_BUCKET:-pawploy-tf-$ACCOUNT-$REGION}
 TABLE=pawploy-deployments
 QUEUE=pawploy-destroy
-SCHED_ROLE=pawploy-scheduler
+SCHED_ROLE=ppw-scheduler   # 플랫폼 역할은 ppw- 접두사: 워커가 다루는 pawploy-* 역할과 섞이지 않게
 APPLY=false
 [ "${1:-}" = "--apply" ] && APPLY=true
 
