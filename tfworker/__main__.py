@@ -34,7 +34,8 @@ from pathlib import Path
 from . import artifacts, awscli, diagnose, expire, health, iac, image, policy, recommendation, store
 from . import job as jobmod, render, terraform as tf
 
-HEALTH_TIMEOUT = {"ec2": 420, "ec2_compose": 420, "lambda": 180, "cloud_run": 180}   # EC2는 부팅 + Docker 설치 시간이 필요
+# EC2는 부팅 + Docker 설치 시간이 필요. ec2_compose 는 Compose 플러그인 내려받기 + 이미지 여러 개 pull + DB 헬스 대기까지
+HEALTH_TIMEOUT = {"ec2": 420, "ec2_compose": 900, "lambda": 180, "cloud_run": 180}
 IN_PROGRESS = {"preparing", "generating", "init", "plan", "apply", "health_check"}
 # 리소스가 남아 있지 않은 클라우드 상태: 같은 deploy_id 로 그 클라우드를 다시 배포할 수 있다
 REUSABLE_TARGET_STATUSES = {None, "failed", "destroyed"}

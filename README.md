@@ -165,7 +165,7 @@ DB·캐시·워커·마이그레이션·nginx 처럼 **컨테이너 여러 개�
 - `images` 키 = InfraFit `deploy_units.images[].id` (영문·숫자·`_`·`.`·`-` 1~63자, 영문·숫자로 시작, 최대 10개). 값은 `image_uri` 와 같은 ECR 규칙
 - 모든 이미지의 ECR 리전이 같아야 합니다(배포 리전 기본값). 태그는 워커가 이미지마다 digest 로 고정합니다
 - 빌드하지 않는 레지스트리 이미지(`postgres:16-alpine`, `redis:7-alpine` 등)는 `images` 에 넣지 않고 템플릿에 그대로 적습니다
-- 헬스체크·앱 로그는 `ec2` 와 같습니다 (진입 컨테이너가 연 80번, 최대 420초 / 실패 시 EC2 콘솔 출력에 `docker compose ps`·로그 끝부분이 함께 남음)
+- 헬스체크·앱 로그는 `ec2` 와 같습니다 (진입 컨테이너가 연 80번. 최대 대기는 Compose 플러그인·이미지 여러 개·DB 준비 때문에 900초 / 실패 시 EC2 콘솔 출력에 `docker compose ps`·로그 끝부분이 함께 남음)
 - 크기: 허용 인스턴스 타입은 그대로(`t3.micro`·`small`·`medium`). 컨테이너가 여럿이면 메모리가 모자라기 쉬우므로 **`medium`(4GB) 권장**
 
 ### AgentCore 가 만들 Terraform 모듈 (18~19단계) — AgentCore 담당과 맞출 약속
@@ -300,7 +300,7 @@ GCP 배포에는 **서비스 계정 키**가 필요합니다. 서비스 계정 �
 | `GOOGLE_APPLICATION_CREDENTIALS` | GCP 서비스 계정 키 파일 경로 |
 | `PAWPLOY_WORK_DIR` | 작업 폴더 위치 (기본 `./work`) |
 | `PAWPLOY_OFFLINE` | `1`이면 AWS 호출 단계를 건너뜀 (시험용) |
-| `PAWPLOY_HEALTH_TIMEOUT`, `PAWPLOY_HEALTH_INTERVAL` | 헬스체크 최대 대기·간격(초). 기본 EC2 420 / Lambda·Cloud Run 180, 간격 10 |
+| `PAWPLOY_HEALTH_TIMEOUT`, `PAWPLOY_HEALTH_INTERVAL` | 헬스체크 최대 대기·간격(초). 기본 EC2 420 / ec2_compose 900 / Lambda·Cloud Run 180, 간격 10 |
 | `TERRAFORM_BIN`, `AWS_BIN` | 실행 파일 경로 |
 
 **동시 실행 방지**: `PAWPLOY_STATUS_TABLE` 이 있으면 deploy·destroy 는 `deploy_id` 단위 잠금(같은 테이블의 `lock#<deploy_id>` 항목, 조건부 쓰기)을 잡고,

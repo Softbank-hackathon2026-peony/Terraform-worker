@@ -109,7 +109,7 @@ tfworker/
   terraform.py       terraform CLI 실행 (로그 실시간 출력, json / text 캡처)
   policy.py          plan(show -json) 검사: 리소스 종류·EC2 타입·크레딧·Lambda 크기·인바운드 80·IAM·Cloud Run 메모리/인스턴스/권한/삭제 보호·필수 태그/label
   artifacts.py       검사를 통과한 작업 폴더를 S3(PAWPLOY_ARTIFACT_BUCKET)에 보관, destroy 때 복원
-  health.py          헬스체크 (EC2 420초, Lambda·Cloud Run 180초)
+  health.py          헬스체크 (EC2 420초, ec2_compose 900초, Lambda·Cloud Run 180초)
   diagnose.py        응답 없음일 때 지우기 전 앱 로그 수집 (EC2 콘솔 / Lambda 로그. Cloud Run 은 아직)
   store.py           result.json 을 DynamoDB(PAWPLOY_STATUS_TABLE)에도 기록. 실패해도 배포는 계속
   expire.py          sweep(로컬+DynamoDB 에서 만료 배포 찾아 destroy), orphans(AWS 태그로 남은 리소스 알림)
@@ -195,7 +195,7 @@ python -m tfworker orphans
    - [ ] 정해지면: 입구(입력을 메시지/S3 경로로 받기), 결과 알림, 워커 실행 역할(최소 권한), GCP 키를 Secrets Manager 로
 7. [x] (2026-10-02 setup_fargate.py --apply) 팀 계정에 S3·상태 테이블·destroy 큐·Scheduler 역할 만들기 (`infra/setup-aws.sh --apply`, 사용자 확인 후) + `sweep`·`drain-destroy-queue` 를 5~10분 주기로 돌릴 자리
 8. [ ] GCP label 기반 남은 리소스 감시 (`orphans` 의 GCP 판), Cloud Run 앱 로그 수집
-9. [ ] 실제 AWS `ec2_compose` 한 바퀴 (`examples/job-ec2-compose.json`, size medium). 부팅 시간이 420초를 넘으면 HEALTH_TIMEOUT 조정
+9. [ ] 실제 AWS `ec2_compose` 한 바퀴 (`examples/job-ec2-compose.json`, size medium). 헬스체크 기본 900초로 충분한지 실제 부팅 시간 확인
 10. [ ] ECS Fargate 모듈 (공용 ALB + 배포별 대상 그룹·리스너 규칙). 추가 시 `job.CLOUD_ARCHITECTURES`·`policy.ALLOWED_TYPES` 에도 등록
 
 ---
