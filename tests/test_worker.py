@@ -18,15 +18,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 FAKE_TF = ROOT / "tools" / "fake-terraform.py"
+FAKE_AWS = ROOT / "tools" / "fake-aws.py"
 
 
-def _fake_terraform_bin(tmp: Path) -> str:
+def _fake_bin(tmp: Path, script: Path, name: str) -> str:
     """shutil.which 가 찾을 수 있는 실행 파일 경로를 돌려준다 (Windows 는 .cmd 래퍼)."""
     if os.name == "nt":
-        wrapper = tmp / "terraform.cmd"
-        wrapper.write_text(f'@"{sys.executable}" "{FAKE_TF}" %*\r\n', encoding="utf-8")
+        wrapper = tmp / f"{name}.cmd"
+        wrapper.write_text(f'@"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
         return str(wrapper)
-    return str(FAKE_TF)
+    return str(script)
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -60,7 +61,7 @@ class WorkerFlowTest(unittest.TestCase):
             **os.environ,
             "PAWPLOY_OFFLINE": "1",
             "PAWPLOY_WORK_DIR": str(self.work),
-            "TERRAFORM_BIN": _fake_terraform_bin(self.tmp),
+            "TERRAFORM_BIN": _fake_bin(self.tmp, FAKE_TF, "terraform"),
             "PAWPLOY_HEALTH_TIMEOUT": "3",
             "PAWPLOY_HEALTH_INTERVAL": "1",
             "FAKE_TF_ENDPOINT": self.healthy_endpoint,
@@ -94,6 +95,18 @@ class WorkerFlowTest(unittest.TestCase):
 
     def result(self, deploy_id="dep-test-ec2") -> dict:
         return json.loads((self.work / deploy_id / "result.json").read_text(encoding="utf-8"))
+
+    def aws_env(self, **extra) -> dict:
+        """가짜 aws CLI 를 쓰는 환경 (PAWPLOY_OFFLINE 을 꺼서 AWS 호출 단계가 실제로 돌게 함)."""
+        self.aws_log = self.tmp / "aws.jsonl"
+        return {"PAWPLOY_OFFLINE": "", "AWS_BIN": _fake_bin(self.tmp, FAKE_AWS, "aws"),
+                "FAKE_AWS_LOG": str(self.aws_log), **extra}
+
+    def aws_calls(self, service: str, op: str) -> list[list[str]]:
+        if not self.aws_log.exists():
+            return []
+        calls = [json.loads(line) for line in self.aws_log.read_text(encoding="utf-8").splitlines()]
+        return [c for c in calls if c[:2] == [service, op]]
 
     # ---------- 시나리오 ----------
 
@@ -264,6 +277,48 @@ class WorkerFlowTest(unittest.TestCase):
         self.assertEqual(tfvars["env"], {"FROM_REC": "1", "APP_MODE": "job"}, "작업 입력 env 가 추천 env 를 덮어씀")
         self.assertEqual(self.result("dep-test-rec")["architecture"], "lambda")
         self.assertTrue((self.work / "dep-test-rec" / "modules" / "lambda" / "main.tf").exists())
+
+    def test_image_is_pinned_to_digest_and_status_goes_to_dynamodb(self):
+        env = self.aws_env(PAWPLOY_STATUS_TABLE="pawploy-deployments", PAWPLOY_ARTIFACT_BUCKET="bkt")
+        code, out = self.run_worker("deploy", self.write_job(), **env)
+        self.assertEqual(code, 0, out)
+
+        # ① 태그 → digest 고정
+        tfvars = json.loads((self.work / "dep-test-ec2" / "terraform.tfvars.json").read_text(encoding="utf-8"))
+        self.assertEqual(tfvars["image_uri"],
+                         "123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/pawploy-sample@sha256:" + "a" * 64)
+        self.assertEqual(len(self.aws_calls("ecr", "describe-images")), 1)
+
+        # ④ S3 보관은 state·결과 파일을 제외하고 올린다
+        sync = self.aws_calls("s3", "sync")
+        self.assertEqual(len(sync), 1, "init 뒤 한 번만 보관")
+        self.assertIn("s3://bkt/workdirs/dep-test-ec2/", sync[0])
+        for excluded in ("*.tfstate", "result.json", "plan.json"):
+            self.assertIn(excluded, sync[0])
+
+        # DynamoDB 에는 상태가 바뀔 때마다 기록되고 마지막은 running
+        puts = self.aws_calls("dynamodb", "put-item")
+        statuses = [json.loads(c[c.index("--item") + 1])["status"]["S"] for c in puts]
+        self.assertEqual(statuses[0], "preparing")
+        self.assertEqual(statuses[-1], "running")
+        last = json.loads(puts[-1][puts[-1].index("--item") + 1])
+        self.assertEqual(last["deploy_id"], {"S": "dep-test-ec2"})
+        self.assertEqual(last["project_id"], {"S": "prj_test"})
+        self.assertEqual(last["endpoint"], {"S": self.healthy_endpoint})
+        self.assertIn("--region", puts[-1])
+
+    def test_missing_image_returns_2(self):
+        code, out = self.run_worker("deploy", self.write_job(), **self.aws_env(FAKE_AWS_ECR_MISSING="1"))
+        self.assertEqual(code, 2, out)
+        self.assertEqual(self.result()["status"], "failed")
+        self.assertFalse((self.work / "dep-test-ec2" / "main.tf").exists(), "이미지가 없으면 Terraform 생성 전에 멈춤")
+
+    def test_dynamodb_attr_roundtrip(self):
+        sys.path.insert(0, str(ROOT))
+        from tfworker import store
+        value = {"s": "x", "n": 3, "f": 1.5, "b": True, "none": None, "l": [1, "a"], "m": {"k": "v"}}
+        self.assertEqual(store.from_attr(store.to_attr(value)), value)
+        self.assertEqual(store.to_attr(True), {"BOOL": True}, "bool 이 숫자로 저장되면 안 됨")
 
     def test_s3_backend_args_include_lockfile(self):
         sys.path.insert(0, str(ROOT))

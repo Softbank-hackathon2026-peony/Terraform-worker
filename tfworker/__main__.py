@@ -19,7 +19,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import artifacts, awscli, diagnose, health, image, policy, recommendation
+from . import artifacts, awscli, diagnose, health, image, policy, recommendation, store
 from . import job as jobmod, render, terraform as tf
 
 HEALTH_TIMEOUT = {"ec2": 420, "lambda": 180}   # EC2는 부팅 + Docker 설치 시간이 필요
@@ -40,6 +40,7 @@ def write_result(job: dict, **fields) -> dict:
                    "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
     path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"[worker] status={result.get('status')}", flush=True)
+    store.put(result, job)   # PAWPLOY_STATUS_TABLE 이 있으면 DynamoDB 에도 (Main Server 가 읽음)
     return result
 
 
