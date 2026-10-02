@@ -134,6 +134,20 @@ class WorkerFlowTest(unittest.TestCase):
         self.assertEqual(r["resource_id"], "i-0fake000000000000", "리소스는 남아 있어야 함 (진단 대상)")
         self.assertTrue((self.work / "dep-test-ec2" / "diagnosis_input.json").exists())
 
+    def test_init_failure_leaves_no_resources_and_id_reusable(self):
+        # init 에서 실패하면 만들어진 리소스가 없다. destroy 를 돌리지 않아야 하고(돌리면 destroy_failed 가 됨),
+        # 같은 deploy_id 로 바로 다시 배포할 수 있어야 한다
+        job = self.write_job()
+        code, out = self.run_worker("deploy", job, FAKE_TF_FAIL="init")
+        self.assertEqual(code, 1, out)
+        r = self.result()
+        self.assertEqual(r["status"], "failed")
+        self.assertNotIn("destroyed", r, "apply 전 실패에는 destroy 가 돌면 안 됨")
+
+        code, out = self.run_worker("deploy", job)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.result()["status"], "running")
+
     def test_input_errors_return_2(self):
         cases = {
             "size": dict(size="xlarge"),
@@ -141,6 +155,7 @@ class WorkerFlowTest(unittest.TestCase):
             "image_uri": dict(image_uri="docker.io/library/nginx:latest"),
             "deploy_id": dict(deploy_id="Bad_ID"),
             "env": dict(env={"1BAD": "x"}),
+            "lambda_region": dict(architecture="lambda", region="us-east-1"),   # 이미지는 ap-northeast-2
         }
         for name, bad in cases.items():
             with self.subTest(field=name):

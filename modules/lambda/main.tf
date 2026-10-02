@@ -26,8 +26,10 @@ locals {
   }
 }
 
+# EC2 모듈과 같은 규칙으로 이름에 deploy_id 를 넣는다 (콘솔에서 어느 배포의 역할인지 바로 알 수 있게).
+# IAM 이름 제한 64자 때문에 name_prefix 는 38자로 자른다 (modules/ec2 참고).
 resource "aws_iam_role" "app" {
-  name_prefix = "pawploy-lambda-"
+  name_prefix = "${substr(var.name, 0, 38)}-"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{

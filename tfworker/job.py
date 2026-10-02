@@ -61,7 +61,11 @@ def validate(raw: dict) -> dict:
             raise JobError(f"환경변수 값에 줄바꿈을 넣을 수 없습니다: {k}")
     env = {k: str(v) for k, v in env.items()}
 
-    region = str(raw.get("region") or _region_from_image(image_uri))
+    image_region = _region_from_image(image_uri)
+    region = str(raw.get("region") or image_region)
+    if architecture == "lambda" and region != image_region:
+        # Lambda 는 다른 리전의 ECR 이미지를 쓸 수 없다. apply 에서 늦게 실패하지 않도록 여기서 거른다
+        raise JobError(f"Lambda 는 이미지와 같은 리전에 배포해야 합니다 (region={region}, 이미지={image_region})")
 
     ttl = _int(raw.get("ttl_minutes", DEFAULT_TTL_MINUTES), "ttl_minutes")
     ttl = max(5, min(ttl, DEFAULT_TTL_MINUTES))            # 최대 1시간

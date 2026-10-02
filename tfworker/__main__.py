@@ -73,6 +73,7 @@ def deploy(job_path: str) -> int:
     write_result(job, status="generating")
     wd = render.render(job)
 
+    applied = False   # apply 를 시작했는지. 그 전에 실패하면 지울 리소스가 없다
     try:
         write_result(job, status="init")
         tf.run(wd, "init", "-upgrade", *render.backend_args(job))
@@ -85,12 +86,18 @@ def deploy(job_path: str) -> int:
         tf.run(wd, "plan", "-out=tfplan")
 
         write_result(job, status="apply")
+        applied = True
         tf.run(wd, "apply", "-auto-approve", "tfplan")
         out = tf.run(wd, "output", "-json", capture_json=True)
     except (tf.TerraformError, awscli.AwsError) as e:
         result = write_result(job, status="failed", error=str(e),
                               log_tail=getattr(e, "output", "")[-4000:])
         _diagnose(job, wd, result)
+        if not applied:
+            # init/plan 단계 실패: 아직 아무것도 만들지 않았다. 여기서 destroy 를 돌리면
+            # init 실패 시 destroy 도 실패해 destroy_failed 가 되고 그 deploy_id 를 다시 못 쓴다
+            print("[worker] apply 전 실패 → 만들어진 리소스 없음, 정리 생략")
+            return 1
         print("[worker] 배포 실패 → 만들어진 리소스 정리 시도")
         _destroy(job, wd, final_status="failed")
         return 1
