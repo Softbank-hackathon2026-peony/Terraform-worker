@@ -13,12 +13,17 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 FAKE_TF = ROOT / "tools" / "fake-terraform.py"
 FAKE_AWS = ROOT / "tools" / "fake-aws.py"
+
+
+def _iso(minutes_ago: int) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - minutes_ago * 60))
 
 
 def _fake_bin(tmp: Path, script: Path, name: str) -> str:
@@ -312,6 +317,86 @@ class WorkerFlowTest(unittest.TestCase):
         self.assertEqual(code, 2, out)
         self.assertEqual(self.result()["status"], "failed")
         self.assertFalse((self.work / "dep-test-ec2" / "main.tf").exists(), "이미지가 없으면 Terraform 생성 전에 멈춤")
+
+    # ---------- 만료 정리 ----------
+
+    def _set_result(self, deploy_id: str, **fields) -> None:
+        path = self.work / deploy_id / "result.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        current = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"deploy_id": deploy_id}
+        path.write_text(json.dumps({**current, **fields}), encoding="utf-8")
+
+    def test_sweep_destroys_only_expired(self):
+        self.assertEqual(self.run_worker("deploy", self.write_job(deploy_id="dep-old"))[0], 0)
+        self.assertEqual(self.run_worker("deploy", self.write_job(deploy_id="dep-new"))[0], 0)
+        self._set_result("dep-old", expires_at="2000-01-01T00:00:00Z")
+        # 진행 중(apply) 상태로 방금 만료된 것은 다른 프로세스가 작업 중일 수 있어 건너뛰고, 한참 지난 것은 잡는다
+        self._set_result("dep-busy-recent", status="apply", expires_at=_iso(minutes_ago=1))
+        self._set_result("dep-busy-stale", status="apply", expires_at=_iso(minutes_ago=30))
+
+        code, out = self.run_worker("sweep", "--dry-run")
+        self.assertEqual(code, 0, out)
+        self.assertIn("dep-old", out)
+        self.assertIn("dep-busy-stale", out)
+        self.assertNotIn("dep-new", out)
+        self.assertNotIn("dep-busy-recent", out)
+        self.assertEqual(self.result("dep-old")["status"], "running", "dry-run 은 지우지 않음")
+
+        code, out = self.run_worker("sweep")
+        self.assertEqual(code, 1, out + "\n(dep-busy-stale 은 작업 폴더가 없어 삭제 실패해야 함)")
+        self.assertEqual(self.result("dep-old")["status"], "destroyed")
+        self.assertEqual(self.result("dep-new")["status"], "running")
+
+        code, out = self.run_worker("sweep")
+        self.assertEqual(code, 1, out)
+        self.assertNotIn("dep-old", out, "destroyed 는 다시 잡히면 안 됨")
+
+    def test_sweep_reads_expired_from_dynamodb(self):
+        items = [{"deploy_id": {"S": "dep-remote"}, "status": {"S": "running"},
+                  "expires_at": {"S": "2000-01-01T00:00:00Z"}, "architecture": {"S": "ec2"}}]
+        env = self.aws_env(PAWPLOY_STATUS_TABLE="t", FAKE_AWS_SCAN_ITEMS=json.dumps(items))
+        code, out = self.run_worker("sweep", "--dry-run", **env)
+        self.assertEqual(code, 0, out)
+        self.assertIn("dep-remote", out)
+        self.assertIn("(dynamodb)", out)
+        scan = self.aws_calls("dynamodb", "scan")
+        self.assertEqual(len(scan), 1)
+        self.assertIn("--filter-expression", scan[0])
+
+    def test_orphans_lists_expired_tagged_resources(self):
+        tagged = [
+            {"ResourceARN": "arn:aws:ec2:ap-northeast-2:123456789012:instance/i-old",
+             "Tags": [{"Key": "pawploy:managed", "Value": "true"}, {"Key": "pawploy:deploy_id", "Value": "dep-old"},
+                      {"Key": "pawploy:expires_at", "Value": "2000-01-01T00:00:00Z"}]},
+            {"ResourceARN": "arn:aws:ec2:ap-northeast-2:123456789012:instance/i-new",
+             "Tags": [{"Key": "pawploy:managed", "Value": "true"}, {"Key": "pawploy:deploy_id", "Value": "dep-new"},
+                      {"Key": "pawploy:expires_at", "Value": "2999-01-01T00:00:00Z"}]},
+        ]
+        code, out = self.run_worker("orphans", **self.aws_env(FAKE_AWS_TAGGED=json.dumps(tagged)))
+        self.assertEqual(code, 1, out)
+        self.assertIn("i-old", out)
+        self.assertNotIn("i-new", out)
+        self.assertIn("삭제하지 않았습니다", out)
+
+        code, out = self.run_worker("orphans", "us-east-1", **self.aws_env(FAKE_AWS_TAGGED="[]"))
+        self.assertEqual(code, 0, out)
+        self.assertIn("--region", self.aws_calls("resourcegroupstaggingapi", "get-resources")[0])
+
+    def test_expire_schedule_rendered_only_with_queue_and_role(self):
+        job = self.write_job()
+        self.assertEqual(self.run_worker("deploy", job)[0], 0)
+        wd = self.work / "dep-test-ec2"
+        self.assertNotIn("aws_scheduler_schedule", (wd / "main.tf").read_text(encoding="utf-8"))
+        self.assertEqual(self.run_worker("destroy", "dep-test-ec2")[0], 0)
+
+        code, out = self.run_worker("deploy", job,
+                                    PAWPLOY_DESTROY_QUEUE_ARN="arn:aws:sqs:ap-northeast-2:123456789012:pawploy-destroy",
+                                    PAWPLOY_SCHEDULER_ROLE_ARN="arn:aws:iam::123456789012:role/pawploy-scheduler")
+        self.assertEqual(code, 0, out)
+        self.assertIn('resource "aws_scheduler_schedule" "expire"', (wd / "main.tf").read_text(encoding="utf-8"))
+        tfvars = json.loads((wd / "terraform.tfvars.json").read_text(encoding="utf-8"))
+        self.assertTrue(tfvars["destroy_queue_arn"].endswith(":pawploy-destroy"))
+        self.assertTrue(tfvars["scheduler_role_arn"].endswith("/pawploy-scheduler"))
 
     def test_dynamodb_attr_roundtrip(self):
         sys.path.insert(0, str(ROOT))

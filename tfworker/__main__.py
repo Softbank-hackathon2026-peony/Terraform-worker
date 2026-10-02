@@ -3,6 +3,8 @@
   python -m tfworker deploy examples/job-ec2.json     # 배포
   python -m tfworker destroy <deploy_id>               # 삭제
   python -m tfworker status <deploy_id>                # 결과 보기
+  python -m tfworker sweep [--dry-run]                 # 만료된 배포 찾아 삭제 (5~10분마다 정기 실행용)
+  python -m tfworker orphans [region]                  # 태그로 만료 지난 리소스 찾기 (알림만, 있으면 exit 1)
 
 배포 단계 (AI 없이 항상 같은 결과를 내는 코드)
   2. 추천 결과 읽기   recommendation.py  (작업 입력에 recommendation_uri가 있을 때)
@@ -10,8 +12,9 @@
   1. ECR 이미지 확인  image.py           (태그 → digest 고정)
   3. Terraform 생성   render.py          (모듈 복사 + 변수 파일)
   4. S3 보관          artifacts.py       (init 뒤에 해서 provider 잠금 파일까지 저장)
-  5. 적용            terraform.py       (plan → apply → output)
+  5. 적용            terraform.py       (plan → 정책 검사 policy.py → apply → output)
   실패·응답 없음이면 diagnose.py가 진단 자료를 모으고 AgentCore 진단 에이전트를 부른다.
+  상태는 result.json 과 DynamoDB(store.py)에 기록하고, 만료 정리는 expire.py 가 맡는다.
 """
 import json
 import os
@@ -19,7 +22,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import artifacts, awscli, diagnose, health, image, policy, recommendation, store
+from . import artifacts, awscli, diagnose, expire, health, image, policy, recommendation, store
 from . import job as jobmod, render, terraform as tf
 
 HEALTH_TIMEOUT = {"ec2": 420, "lambda": 180}   # EC2는 부팅 + Docker 설치 시간이 필요
@@ -177,12 +180,53 @@ def status(deploy_id: str) -> int:
     return 0
 
 
-def main(argv: list[str]) -> int:
-    if len(argv) != 2 or argv[0] not in {"deploy", "destroy", "status"}:
-        print(__doc__)
+def sweep(dry_run: bool) -> int:
+    """만료됐는데 살아 있는 배포를 모두 destroy 한다. 정기 실행(크론 등) 용."""
+    expired = expire.find_expired()
+    if not expired:
+        print("[sweep] 만료된 배포 없음")
+        return 0
+    failed = []
+    for d in expired:
+        print(f"[sweep] 만료 {d['deploy_id']}: expires_at={d['expires_at']} status={d['status']} ({d['source']})")
+        if not dry_run and destroy(d["deploy_id"]) != 0:
+            failed.append(d["deploy_id"])
+    if dry_run:
+        print(f"[sweep] --dry-run: {len(expired)}개를 지우지 않았습니다")
+        return 0
+    if failed:
+        print(f"[sweep] 삭제 실패: {', '.join(failed)}")
+        return 1
+    print(f"[sweep] {len(expired)}개 삭제 완료")
+    return 0
+
+
+def orphans(region: str) -> int:
+    """pawploy 태그가 붙었는데 만료 시각이 지난 리소스를 찾아 보여 준다. 지우지는 않는다."""
+    try:
+        found = expire.find_orphans(region)
+    except awscli.AwsError as e:
+        print(f"[orphans] 조회 실패: {e}")
         return 2
-    cmd, arg = argv
-    return {"deploy": deploy, "destroy": destroy, "status": status}[cmd](arg)
+    if not found:
+        print(f"[orphans] {region}: 만료 지난 리소스 없음")
+        return 0
+    for o in found:
+        print(f"[orphans] {o['arn']}  deploy_id={o['deploy_id']} expires_at={o['expires_at']}")
+    print(f"[orphans] {len(found)}개. 삭제하지 않았습니다 → 'python -m tfworker destroy <deploy_id>' 로 정리하세요")
+    return 1   # 정기 실행에서 알림 조건으로 쓰도록 0 이 아닌 코드
+
+
+def main(argv: list[str]) -> int:
+    cmd, args = (argv[0] if argv else None), argv[1:]
+    if cmd == "sweep" and not set(args) - {"--dry-run"}:
+        return sweep("--dry-run" in args)
+    if cmd == "orphans" and len(args) <= 1:
+        return orphans(args[0] if args else expire.DEFAULT_REGION)
+    if cmd in {"deploy", "destroy", "status"} and len(args) == 1:
+        return {"deploy": deploy, "destroy": destroy, "status": status}[cmd](args[0])
+    print(__doc__)
+    return 2
 
 
 if __name__ == "__main__":

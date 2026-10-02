@@ -59,6 +59,33 @@ module "app" {{
 output "endpoint"    {{ value = module.app.endpoint }}
 output "health_url"  {{ value = module.app.health_url }}
 output "resource_id" {{ value = module.app.resource_id }}
+{scheduler}"""
+
+# 만료 시각에 destroy 요청을 보내는 예약 (expire.py 의 1번 그물). 환경변수가 둘 다 있을 때만 main.tf 에 들어간다.
+# 큐와 역할은 팀 계정에 한 번만 만들어 둔다 (역할: scheduler.amazonaws.com 신뢰 + 그 큐에 sqs:SendMessage).
+# 요청을 받아 `python -m tfworker destroy` 를 실행하는 소비자는 Main Server 연결 방식과 함께 정한다.
+SCHEDULER_TF = """
+# ---------------- 만료 시각 destroy 예약 ----------------
+# 한 번 실행된 뒤 스케줄은 스스로 지워진다(DELETE). 그 전에 destroy 되면 state 와 함께 지워진다.
+variable "destroy_queue_arn"  { type = string }
+variable "scheduler_role_arn" { type = string }
+
+resource "aws_scheduler_schedule" "expire" {
+  name                         = "pawploy-${var.deploy_id}-expire"
+  schedule_expression          = "at(${trimsuffix(var.expires_at, "Z")})"
+  schedule_expression_timezone = "UTC"
+  action_after_completion      = "DELETE"
+
+  flexible_time_window {
+    mode = "OFF"
+  }
+
+  target {
+    arn      = var.destroy_queue_arn
+    role_arn = var.scheduler_role_arn
+    input    = jsonencode({ action = "destroy", deploy_id = var.deploy_id, project_id = var.project_id })
+  }
+}
 """
 
 
@@ -104,11 +131,21 @@ def render(job: dict) -> Path:
     job["state_bucket"] = os.environ.get("PAWPLOY_STATE_BUCKET") or None
     job["state_region"] = os.environ.get("PAWPLOY_STATE_REGION", job["region"])
     backend = '  backend "s3" {}\n' if job["state_bucket"] else ""
-    (wd / "main.tf").write_text(MAIN_TF.format(backend=backend, architecture=job["architecture"]), encoding="utf-8")
+
+    # 만료 시각 destroy 예약: 큐·역할 ARN 이 둘 다 있을 때만 (없으면 sweep 정기 점검만으로 지운다)
+    job["destroy_queue_arn"] = os.environ.get("PAWPLOY_DESTROY_QUEUE_ARN") or None
+    job["scheduler_role_arn"] = os.environ.get("PAWPLOY_SCHEDULER_ROLE_ARN") or None
+    scheduled = bool(job["destroy_queue_arn"] and job["scheduler_role_arn"])
+
+    (wd / "main.tf").write_text(
+        MAIN_TF.format(backend=backend, architecture=job["architecture"],
+                       scheduler=SCHEDULER_TF if scheduled else ""), encoding="utf-8")
 
     tfvars = {k: job[k] for k in (
         "region", "project_id", "deploy_id", "expires_at", "image_uri",
         "container_port", "size", "health_path", "env")}
+    if scheduled:
+        tfvars.update(destroy_queue_arn=job["destroy_queue_arn"], scheduler_role_arn=job["scheduler_role_arn"])
     (wd / "terraform.tfvars.json").write_text(json.dumps(tfvars, indent=2, ensure_ascii=False), encoding="utf-8")
     (wd / "job.json").write_text(json.dumps(job, indent=2, ensure_ascii=False), encoding="utf-8")
     return wd
