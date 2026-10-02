@@ -135,7 +135,7 @@ tools/
   fake-aws.py           가짜 aws CLI (FAKE_AWS_LOG 에 호출 기록, ECR·DynamoDB·S3·태그 조회 응답 흉내)
   push-sample-image.sh  샘플 이미지 linux/amd64 빌드 → ECR 푸시 (--provenance=false 필수, Lambda 가 이미지 인덱스를 거부)
 tests/
-  test_worker.py     unittest 36개. `python -m unittest -v` (비용 없음, 40초 안팎)
+  test_worker.py     unittest 42개. `python -m unittest -v` (비용 없음, 1분 안팎)
 ```
 
 - S3 backend 는 `use_lockfile=true`로 잠금 → Terraform **1.10 이상**. key 는 `deployments/<project_id>/<deploy_id>/<cloud>.tfstate` (GCP state 도 S3)
@@ -156,7 +156,7 @@ python -m tfworker orphans
 
 - 로컬 환경: Windows는 Terraform 1.16, AWS CLI v2, Python 3.14 (`python` 대신 `py`). Mac은 Terraform 1.16.4, Python `/opt/homebrew/bin/python3.12` (시스템 python3 3.9는 `str | None` 문법 때문에 안 됨)
 - 확인된 것 (2026-10-02)
-  - `tests/` 27개 통과: 단일·멀티 클라우드, GCP 단독, 한쪽 실패 후 그쪽만 재시도·만료 시각 유지, 단계별 실패 보고(apply·init·plan·health_check)·정리, AgentCore 모듈 사용·IaC 거부·정책 거부, 입력 오류 11종, 클라우드 하나만 destroy, state 없는 destroy 거부, sweep·orphans, digest 고정·DynamoDB 기록
+  - `tests/` 42개 통과 (2026-10-03): 단일·멀티 클라우드, GCP 단독, 한쪽 실패 후 그쪽만 재시도·만료 시각 유지, 단계별 실패 보고(apply·init·plan·health_check)·정리, AgentCore 모듈 사용·IaC 거부·정책 거부, 입력 오류 11종, 클라우드 하나만 destroy, state 없는 destroy 거부, sweep·orphans, digest 고정·DynamoDB 기록
   - 실제 terraform `validate`·`fmt` 통과: EC2·Lambda·Cloud Run (AWS provider 6.67, Google provider 6.50, deploy_id 40자)
   - 실제 terraform `plan` 으로 새 AWS 정책 검사(IAM 정책 허용 목록·크레딧) 통과 확인
   - **실제 AWS EC2 한 바퀴 성공** (`dep-demo-ec2b`, 249초) — `targets` 구조로 바꾸기 전 코드
@@ -173,7 +173,7 @@ python -m tfworker orphans
   - Cloud Run `deletion_protection` 기본값이 true 라 그대로 두면 destroy 가 실패함 → 모듈·검사에서 false 강제
   - Cloud Run 에 `PORT` 환경변수를 직접 넣으면 거부됨 (Cloud Run 이 container_port 로 자동 설정)
   - Cloud Run 생성 시 **워커 계정에 이미지 저장소 읽기 권한**(`roles/artifactregistry.reader`, 저장소 단위)이 필요. 없으면 apply 403 (`artifactregistry.repositories.downloadArtifacts`)
-  - GCP 인증 키: `C:\keys\pawploy-worker.json` (저장소 밖). 사용자 환경변수에는 아직 등록 안 됨 → 실행 시 `GOOGLE_APPLICATION_CREDENTIALS` 지정 필요
+  - GCP 인증 키: 운영(Fargate)은 Secrets Manager `pawploy/gcp-worker-key` → `GOOGLE_CREDENTIALS`. 로컬 실행은 키 파일 경로를 `GOOGLE_APPLICATION_CREDENTIALS` 로 지정 (Windows PC: `C:\keys\pawploy-worker.json`, 저장소 밖. 다른 PC 는 따로 안전하게 복사하거나 새 키 발급)
 
 ---
 
@@ -183,20 +183,27 @@ python -m tfworker orphans
 2. [x] 바뀐 구조(targets)로 EC2 한 바퀴 재확인 (2026-10-02)
 3. [x] GCP 서비스 계정 키 준비 → 샘플 이미지 Artifact Registry 푸시 → Cloud Run 한 바퀴 (2026-10-02)
 4. [x] AWS + GCP 동시 한 바퀴, Lambda 한 바퀴 (2026-10-03 `dep-test-1`)
-5. [ ] AgentCore 담당과 모듈 약속(README "AgentCore 가 만들 Terraform 모듈") 확정, S3 경로 규칙 정하기
-6. [ ] Main Server와 연결 방식 결정 (SQS / CodeBuild / ECS 작업). **Lambda에서 실행은 비추천** (15분 제한). 사용자가 Main 담당과 논의 중
-   - [x] 연결 방식과 무관한 준비 (2026-10-02): 입력 오류 기록, DynamoDB 잠금·결과 이어받기, 만료 큐 소비자(`drain-destroy-queue`), 워커 컨테이너 이미지(컨테이너 안에서 GCP plan 확인)
-   - [ ] 정해지면: 입구(입력을 메시지/S3 경로로 받기), 결과 알림, 워커 실행 역할(최소 권한), GCP 키를 Secrets Manager 로
+5. [x] AgentCore 모듈 약속·S3 경로 확정 (2026-10-03): `pawploy-agent-<계정>/projects/<p>/deploy/<d>/attempt-<N>/{aws,gcp}/`
+6. [x] Main Server 연결 방식 (우리가 정한 대로 Main 이 맞춤): S3 작업 JSON + SQS FIFO `pawploy-jobs.fifo` → DynamoDB `pawploy-deployments` 조회. 명세는 노션 "Terraform Worker 연동 명세"
+   - [x] 워커 실행 역할 최소 권한(`ppw-worker-task`), GCP 키 Secrets Manager, Fargate 서비스 가동
 7. [x] (2026-10-02 setup_fargate.py --apply) 팀 계정에 S3·상태 테이블·destroy 큐·Scheduler 역할 만들기 (`infra/setup-aws.sh --apply`, 사용자 확인 후) + `sweep`·`drain-destroy-queue` 를 5~10분 주기로 돌릴 자리
 8. [ ] GCP label 기반 남은 리소스 감시 (`orphans` 의 GCP 판), Cloud Run 앱 로그 수집
 9. [ ] ECS Fargate 모듈 (공용 ALB + 배포별 대상 그룹·리스너 규칙). 추가 시 `job.CLOUD_ARCHITECTURES`·`policy.ALLOWED_TYPES` 에도 등록
+10. [ ] **실패 → 22단계 보고 → AgentCore `fix_terraform` → attempt-2 재배포 실제 한 바퀴** ← 다음 최우선 (AgentCore 담당과 함께)
+11. [ ] CodeBuild 역할 `pawploy-codebuild` 가 워커 IAM 범위 `role/pawploy-*` 에 걸림 → `ppw-codebuild` 로 이름 변경 또는 워커 정책에 Deny (Build Worker 담당과 협의)
+12. [ ] AWS Budgets·GCP 예산 알림 (지금 계정에 예산 없음), ALB 가 CloudFront 경유 요청만 받는지 확인 (Main 담당)
+
+### 기타 산출물
+- PR #3 (`feat/multi-cloud-a-plan` → `main`) 머지됨 (2026-10-03)
+- 아키텍처 다이어그램: `docs/pawploy-aws-architecture.drawio` (draw.io AWS 공식 아이콘. VS Code 확장 Draw.io Integration 으로 열기)
+- 노션: "Pawploy Terraform Worker 정리", "Terraform Worker 연동 명세 (Main Server → Worker)" (개인 페이지)
 
 ---
 
 ## 5. 우리 계정에 배포하므로 지켜야 할 것
 
 - **격리**: 사용자 앱의 권한은 로그 쓰기·이미지 읽기만. AWS 는 관리형 정책 2개만 허용, GCP 는 역할 없는 앱 전용 서비스 계정(기본 Compute 계정은 편집자 권한이라 금지)
-- **워커 권한**: 지금은 관리자 권한으로 시험 중. 서버로 옮길 때 `pawploy:managed` 태그·`pawploy-` 접두사로 제한, IAM 역할 생성 시 권한 경계. 워커 권한이 넓으므로 AgentCore 코드가 워커 파일·비밀값·토큰을 읽지 못하게 `iac.py` 로 막는다
+- **워커 권한**: Fargate 워커는 `ppw-worker-task` (앱 리소스는 `pawploy-*` 이름, 플랫폼 리소스는 `ppw-*` 이름으로 분리, IAM 정책은 앱용 2개만 붙일 수 있음). 로컬 시험은 관리자 키. 이후 권한 경계 추가 검토. 워커 권한이 넓으므로 AgentCore 코드가 워커 파일·비밀값·토큰을 읽지 못하게 `iac.py` 로 막는다
 - **악용 방지**: 크기 제한, CPU 크레딧 standard, Lambda 짧은 타임아웃, Cloud Run 인스턴스 최대 1, ECS `desired_count = 1`, 동시 배포 수·시간당 배포 횟수 제한(Main Server), GPU·SageMaker 금지, AWS Budgets·GCP 예산 알림
 - **삭제가 배포보다 중요**: destroy가 확실히 되는 것이 비용·악용 관리의 핵심
 
