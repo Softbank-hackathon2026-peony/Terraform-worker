@@ -36,15 +36,15 @@ provider "aws" {{
   }}
 }}
 
-variable "region"         {{ type = string }}
-variable "project_id"     {{ type = string }}
-variable "deploy_id"      {{ type = string }}
-variable "expires_at"     {{ type = string }}
-variable "image_uri"      {{ type = string }}
+variable "region" {{ type = string }}
+variable "project_id" {{ type = string }}
+variable "deploy_id" {{ type = string }}
+variable "expires_at" {{ type = string }}
+variable "image_uri" {{ type = string }}
 variable "container_port" {{ type = number }}
-variable "size"           {{ type = string }}
-variable "health_path"    {{ type = string }}
-variable "env"            {{ type = map(string) }}
+variable "size" {{ type = string }}
+variable "health_path" {{ type = string }}
+variable "env" {{ type = map(string) }}
 
 module "app" {{
   source         = "./modules/{architecture}"
@@ -56,8 +56,8 @@ module "app" {{
   health_path    = var.health_path
 }}
 
-output "endpoint"    {{ value = module.app.endpoint }}
-output "health_url"  {{ value = module.app.health_url }}
+output "endpoint" {{ value = module.app.endpoint }}
+output "health_url" {{ value = module.app.health_url }}
 output "resource_id" {{ value = module.app.resource_id }}
 {scheduler}"""
 
@@ -67,7 +67,7 @@ output "resource_id" {{ value = module.app.resource_id }}
 SCHEDULER_TF = """
 # ---------------- 만료 시각 destroy 예약 ----------------
 # 한 번 실행된 뒤 스케줄은 스스로 지워진다(DELETE). 그 전에 destroy 되면 state 와 함께 지워진다.
-variable "destroy_queue_arn"  { type = string }
+variable "destroy_queue_arn" { type = string }
 variable "scheduler_role_arn" { type = string }
 
 resource "aws_scheduler_schedule" "expire" {
