@@ -6,12 +6,14 @@
 
 흉내 내는 명령
   ecr describe-images                      → 이미지 1건 (digest sha256:aaaa…). FAKE_AWS_ECR_MISSING=1 이면 빈 결과
-  dynamodb put-item                        → {}
+  dynamodb put-item / get-item / delete-item → FAKE_AWS_DB(JSON 파일)에 저장. 잠금용 조건식
+                                             (attribute_not_exists·lease_until < :now / #o = :me)을 흉내 낸다.
+                                             조건이 맞지 않으면 ConditionalCheckFailedException (exit 254)
   dynamodb scan                            → FAKE_AWS_SCAN_ITEMS (JSON 배열) 를 Items 로
+  sqs receive-message / delete-message     → FAKE_AWS_SQS(JSON 파일, 메시지 본문 배열)에서 꺼내고 지운다
   s3 sync / s3 cp                          → 빈 출력 (cp 대상이 "-" 면 FAKE_AWS_S3_BODY)
   resourcegroupstaggingapi get-resources   → FAKE_AWS_TAGGED (JSON 배열) 를 ResourceTagMappingList 로
   ec2 get-console-output / logs tail       → 가짜 로그 텍스트
-  bedrock-agentcore invoke-agent-runtime   → 출력 파일에 {"summary": ...} 저장
   sts get-caller-identity                  → 계정 123456789012
 
 환경변수
@@ -24,6 +26,53 @@ import sys
 from pathlib import Path
 
 DIGEST = "sha256:" + "a" * 64
+
+
+def _load(env: str, default):
+    path = os.environ.get(env)
+    if path and Path(path).exists():
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    return default
+
+
+def _save(env: str, data) -> None:
+    path = os.environ.get(env)
+    if path:
+        Path(path).write_text(json.dumps(data), encoding="utf-8")
+
+
+def _conditional_failed(op: str) -> int:
+    print(f"An error occurred (ConditionalCheckFailedException) when calling the {op} operation: "
+          "The conditional request failed", file=sys.stderr)
+    return 254
+
+
+def _dynamodb(op: str, arg) -> int:
+    db = _load("FAKE_AWS_DB", {})
+    condition = arg("--condition-expression")
+    values = json.loads(arg("--expression-attribute-values") or "{}")
+    if op == "put-item":
+        item = json.loads(arg("--item"))
+        key = item["deploy_id"]["S"]
+        old = db.get(key)
+        if condition and old is not None:   # attribute_not_exists(deploy_id) OR lease_until < :now
+            if not int(old.get("lease_until", {}).get("N", "0")) < int(values[":now"]["N"]):
+                return _conditional_failed("PutItem")
+        db[key] = item
+        _save("FAKE_AWS_DB", db)
+        print("{}")
+    elif op == "get-item":
+        key = json.loads(arg("--key"))["deploy_id"]["S"]
+        print(json.dumps({"Item": db[key]} if key in db else {}))
+    elif op == "delete-item":
+        key = json.loads(arg("--key"))["deploy_id"]["S"]
+        old = db.get(key)
+        if condition and (old is None or old.get("owner") != values.get(":me")):   # #o = :me
+            return _conditional_failed("DeleteItem")
+        db.pop(key, None)
+        _save("FAKE_AWS_DB", db)
+        print("{}")
+    return 0
 
 
 def main(argv: list[str]) -> int:
@@ -47,8 +96,13 @@ def main(argv: list[str]) -> int:
             return 254
         print(json.dumps({"imageDetails": [{"imageDigest": DIGEST, "imageTags": ["latest"],
                                             "repositoryName": arg("--repository-name")}]}))
-    elif (service, op) == ("dynamodb", "put-item"):
-        print("{}")
+    elif service == "dynamodb" and op in ("put-item", "get-item", "delete-item"):
+        return _dynamodb(op, arg)
+    elif (service, op) == ("sqs", "receive-message"):
+        bodies = _load("FAKE_AWS_SQS", [])
+        _save("FAKE_AWS_SQS", [])
+        print(json.dumps({"Messages": [{"Body": b, "ReceiptHandle": f"rh-{i}"} for i, b in enumerate(bodies)]}
+                         if bodies else {}))
     elif (service, op) == ("dynamodb", "scan"):
         print(json.dumps({"Items": json.loads(os.environ.get("FAKE_AWS_SCAN_ITEMS", "[]")), "Count": 0}))
     elif service == "s3":
@@ -60,11 +114,6 @@ def main(argv: list[str]) -> int:
         print(json.dumps({"InstanceId": arg("--instance-id"), "Output": "[pawploy] fake console output"}))
     elif (service, op) == ("logs", "tail"):
         print("fake lambda log line")
-    elif (service, op) == ("bedrock-agentcore", "invoke-agent-runtime"):
-        # 출력 파일은 위치 인자 (awscli.run 이 --region 을 뒤에 붙이므로 이름으로 찾는다)
-        outfile = next((a for a in argv[2:] if a.endswith("diagnosis_output.json")), None)
-        if outfile:
-            Path(outfile).write_text(json.dumps({"summary": "fake diagnosis", "likely_cause": "unknown"}), encoding="utf-8")
     elif (service, op) == ("sts", "get-caller-identity"):
         print(json.dumps({"Account": "123456789012", "Arn": "arn:aws:iam::123456789012:user/fake"}))
     else:

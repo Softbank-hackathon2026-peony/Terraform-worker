@@ -110,6 +110,10 @@ tfworker/
   store.py           result.json 을 DynamoDB(PAWPLOY_STATUS_TABLE)에도 기록. 실패해도 배포는 계속
   expire.py          sweep(로컬+DynamoDB 에서 만료 배포 찾아 destroy), orphans(AWS 태그로 남은 리소스 알림)
   awscli.py          aws CLI 실행 도우미 (PAWPLOY_OFFLINE=1이면 AWS 호출 단계 건너뜀)
+  (store.py)         + deploy_id 단위 잠금(같은 테이블 lock#<id>, 조건부 쓰기, 임대 3600초)·결과 조회(get)
+  (__main__.py)      + 입력 오류 기록(status=rejected / last_rejection), 다른 워커의 결과 이어받기, drain-destroy-queue
+Dockerfile         워커 실행 이미지 (python 3.12 + terraform 1.16.0 체크섬 검증 + aws CLI, 사용자 worker, /work)
+infra/setup-aws.sh S3 버킷·DynamoDB·SQS·Scheduler 역할 생성 (기본 출력만, --apply 로 생성). 아직 실행 안 함
 modules/
   ec2/            Amazon Linux 2023 + Docker. 기본 VPC, 80번 포트만, ECR 읽기 권한, IMDSv2, 디스크 암호화, CPU 크레딧 standard
     user_data.sh.tftpl   부팅 시 Docker 설치 → ECR 로그인 → 이미지 실행 (-p 80:<container_port>)
@@ -123,7 +127,7 @@ tools/
   fake-aws.py           가짜 aws CLI (FAKE_AWS_LOG 에 호출 기록, ECR·DynamoDB·S3·태그 조회 응답 흉내)
   push-sample-image.sh  샘플 이미지 linux/amd64 빌드 → ECR 푸시 (--provenance=false 필수, Lambda 가 이미지 인덱스를 거부)
 tests/
-  test_worker.py     unittest 27개. `python -m unittest -v` (비용 없음, 30초 내외)
+  test_worker.py     unittest 32개. `python -m unittest -v` (비용 없음, 30~40초)
 ```
 
 - S3 backend 는 `use_lockfile=true`로 잠금 → Terraform **1.10 이상**. key 는 `deployments/<project_id>/<deploy_id>/<cloud>.tfstate` (GCP state 도 S3)
@@ -168,8 +172,10 @@ python -m tfworker orphans
 3. [x] GCP 서비스 계정 키 준비 → 샘플 이미지 Artifact Registry 푸시 → Cloud Run 한 바퀴 (2026-10-02)
 4. [ ] AWS + GCP 동시 한 바퀴, Lambda 한 바퀴 (Lambda 전에 Web Adapter 1.1.0 으로 이미지 다시 빌드)
 5. [ ] AgentCore 담당과 모듈 약속(README "AgentCore 가 만들 Terraform 모듈") 확정, S3 경로 규칙 정하기
-6. [ ] Main Server와 연결 방식 결정 (SQS / CodeBuild / ECS 작업). **Lambda에서 실행은 비추천** (15분 제한). destroy 큐 소비자도 함께
-7. [ ] 팀 계정에 상태 테이블·destroy 큐·Scheduler 역할 만들기 + `sweep` 을 5~10분 주기로 돌릴 자리
+6. [ ] Main Server와 연결 방식 결정 (SQS / CodeBuild / ECS 작업). **Lambda에서 실행은 비추천** (15분 제한). 사용자가 Main 담당과 논의 중
+   - [x] 연결 방식과 무관한 준비 (2026-10-02): 입력 오류 기록, DynamoDB 잠금·결과 이어받기, 만료 큐 소비자(`drain-destroy-queue`), 워커 컨테이너 이미지(컨테이너 안에서 GCP plan 확인)
+   - [ ] 정해지면: 입구(입력을 메시지/S3 경로로 받기), 결과 알림, 워커 실행 역할(최소 권한), GCP 키를 Secrets Manager 로
+7. [ ] 팀 계정에 S3·상태 테이블·destroy 큐·Scheduler 역할 만들기 (`infra/setup-aws.sh --apply`, 사용자 확인 후) + `sweep`·`drain-destroy-queue` 를 5~10분 주기로 돌릴 자리
 8. [ ] GCP label 기반 남은 리소스 감시 (`orphans` 의 GCP 판), Cloud Run 앱 로그 수집
 9. [ ] ECS Fargate 모듈 (공용 ALB + 배포별 대상 그룹·리스너 규칙). 추가 시 `job.CLOUD_ARCHITECTURES`·`policy.ALLOWED_TYPES` 에도 등록
 

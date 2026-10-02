@@ -61,7 +61,20 @@ python -m tfworker status <deploy_id>              # 결과 (work/<deploy_id>/re
 python -m tfworker destroy <deploy_id> [aws|gcp]   # 삭제 (클라우드 하나만도 가능)
 python -m tfworker sweep [--dry-run]               # 만료된 배포를 모두 삭제 (5~10분마다 정기 실행)
 python -m tfworker orphans [region]                # 태그로 만료 지난 AWS 리소스 찾기 (삭제 안 함, 있으면 exit 1)
+python -m tfworker drain-destroy-queue [queue_url]  # 만료 예약(SQS) 메시지를 모두 받아 destroy (sweep 과 함께 정기 실행)
 ```
+
+### 컨테이너 이미지 (클라우드에서 실행)
+
+```bash
+docker build --platform linux/amd64 -t pawploy-tf-worker .     # python + terraform 1.16 + aws CLI, root 아닌 사용자
+docker run --rm -e PAWPLOY_STATE_BUCKET=... -e PAWPLOY_ARTIFACT_BUCKET=... -e PAWPLOY_STATUS_TABLE=... \
+  pawploy-tf-worker deploy /jobs/job.json
+```
+
+컨테이너의 `/work` 는 실행이 끝나면 사라지므로, 클라우드에서는 **S3 버킷·DynamoDB 테이블을 반드시 지정**합니다
+(없으면 state 가 사라져 destroy 를 못 하고 리소스가 남습니다). 필요한 인프라는 `bash infra/setup-aws.sh` 로 확인하고 `--apply` 로 만듭니다.
+AWS 권한은 실행 환경의 IAM 역할로, GCP 키는 비밀 저장소에서 파일로 넣어 `GOOGLE_APPLICATION_CREDENTIALS` 로 지정합니다 (이미지에 넣지 않음).
 
 > Windows에서 `python`이 동작하지 않으면 `py -m tfworker ...`로 실행하세요.
 
@@ -189,7 +202,9 @@ plan 결과는 apply 전에 `policy.py` 가 한 번 더 검사합니다(인스�
 
 | 필드 | 뜻 |
 |---|---|
-| `status` (전체) | `deploying` · `running`(모두 성공) · `partial`(일부 성공) · `failed`(모두 실패, 남은 리소스 없음) · `destroying` · `destroyed` · `destroy_failed` |
+| `status` (전체) | `deploying` · `running`(모두 성공) · `partial`(일부 성공) · `failed`(모두 실패, 남은 리소스 없음) · `destroying` · `destroyed` · `destroy_failed` · `rejected`(입력 오류로 시작하지 않음) |
+| `error` (최상위) | `rejected` 일 때 입력 오류 이유 |
+| `last_rejection` | 이미 있는 배포에 대한 요청이 거부됐을 때 `{error, at}`. 기존 상태는 바뀌지 않음 |
 | `targets.<cloud>.status` | `preparing` → `generating` → `init` → `plan` → `apply` → `health_check` → `running` / `failed` / `destroying` → `destroyed` / `destroy_failed` |
 | `failed_stage` | 22단계 "실패 단계". 위 상태 이름 중 하나 (`generating` 이면 IaC 검사 위반, `plan` 이면 정책 위반도 포함) |
 | `error`, `log_tail` | 22단계 "오류 로그". AgentCore 에 수정을 맡길 때 그대로 넘기면 됨 |
@@ -230,12 +245,18 @@ GCP 배포에는 **서비스 계정 키**가 필요합니다. 서비스 계정 �
 | `PAWPLOY_STATUS_TABLE` | 지정하면 결과를 DynamoDB 에도 기록 (파티션 키 `deploy_id`). `sweep` 이 다른 머신의 배포도 찾는 근거 |
 | `PAWPLOY_STATUS_REGION` | 상태 테이블 리전 (기본 `PAWPLOY_REGION`) |
 | `PAWPLOY_DESTROY_QUEUE_ARN`, `PAWPLOY_SCHEDULER_ROLE_ARN` | 둘 다 있으면 AWS target 에 EventBridge Scheduler 예약을 함께 만듦 |
+| `PAWPLOY_DESTROY_QUEUE_URL` | `drain-destroy-queue` 가 읽을 큐 주소 |
+| `PAWPLOY_LOCK_LEASE_SEC` | DynamoDB 배포 잠금 임대 시간(초, 기본 3600). 워커가 죽어도 이 시간 뒤 잠금이 풀림 |
 | `PAWPLOY_REGION` | `sweep`·`orphans`·상태 테이블 기본 리전 (기본 `ap-northeast-2`) |
 | `GOOGLE_APPLICATION_CREDENTIALS` | GCP 서비스 계정 키 파일 경로 |
 | `PAWPLOY_WORK_DIR` | 작업 폴더 위치 (기본 `./work`) |
 | `PAWPLOY_OFFLINE` | `1`이면 AWS 호출 단계를 건너뜀 (시험용) |
 | `PAWPLOY_HEALTH_TIMEOUT`, `PAWPLOY_HEALTH_INTERVAL` | 헬스체크 최대 대기·간격(초). 기본 EC2 420 / Lambda·Cloud Run 180, 간격 10 |
 | `TERRAFORM_BIN`, `AWS_BIN` | 실행 파일 경로 |
+
+**동시 실행 방지**: `PAWPLOY_STATUS_TABLE` 이 있으면 deploy·destroy 는 `deploy_id` 단위 잠금(같은 테이블의 `lock#<deploy_id>` 항목, 조건부 쓰기)을 잡고,
+다른 워커가 DynamoDB 에 남긴 결과를 이어받은 뒤 진행합니다. 잠금을 못 잡으면 deploy 는 종료 코드 2, destroy 는 1(다음 점검에서 재시도)입니다.
+SQS 중복 메시지, sweep·사용자 종료·재시도가 겹치는 경우를 막습니다.
 
 **다른 머신·컨테이너에서 destroy하려면** `PAWPLOY_STATE_BUCKET`과 `PAWPLOY_ARTIFACT_BUCKET`이 둘 다 필요합니다.
 state를 찾을 수 없으면 destroy를 거부하고 `destroy_failed`를 기록합니다. state 없이 destroy하면 terraform은 "지울 것 없음"으로 성공해 버리고, 실제 리소스는 남기 때문입니다.
@@ -248,24 +269,18 @@ state를 찾을 수 없으면 destroy를 거부하고 `destroy_failed`를 기록
 
 | 겹 | 무엇이 | 언제 | 켜는 조건 |
 |---|---|---|---|
-| 1. 예약 | EventBridge Scheduler 가 SQS 큐로 `{"action":"destroy","deploy_id":...}` 전송 (AWS target 에만 생성, 메시지는 배포 전체 삭제 요청) | 정확히 `expires_at` | `PAWPLOY_DESTROY_QUEUE_ARN` + `PAWPLOY_SCHEDULER_ROLE_ARN` |
+| 1. 예약 | EventBridge Scheduler 가 SQS 큐로 `{"action":"destroy","deploy_id":...}` 전송 (AWS target 에만 생성, 메시지는 배포 전체 삭제 요청) → `drain-destroy-queue` 가 받아 destroy | 정확히 `expires_at` (+ 큐 처리 주기) | `PAWPLOY_DESTROY_QUEUE_ARN` + `PAWPLOY_SCHEDULER_ROLE_ARN`, 처리: `PAWPLOY_DESTROY_QUEUE_URL` |
 | 2. 정기 점검 | `sweep` 이 로컬 `work/` 와 DynamoDB 에서 만료됐는데 `destroyed`/`failed` 가 아닌 배포(`partial` 포함)를 찾아 **모든 클라우드** destroy | 5~10분마다 | 항상 |
 | 3. 태그 감시 | `orphans` 가 `pawploy:expires_at` 태그가 지난 **AWS** 리소스를 목록으로 출력 (삭제 안 함) | 하루 몇 번 | 항상. GCP label 감시는 아직 없음 |
 
 - GCP 만 배포한 경우 1번 예약이 없으므로 2번 `sweep` 이 지웁니다.
 - `sweep` 은 `deploying`·`destroying` 처럼 다른 프로세스가 작업 중일 수 있는 상태는 만료 15분 뒤까지 건너뜁니다.
 
-한 번만 만들어 두는 것 (팀 AWS 계정):
+한 번만 만들어 두는 것 (팀 AWS 계정): S3 버킷(state·작업 폴더, 비공개·암호화·버전 관리), DynamoDB 테이블, SQS 큐, Scheduler 역할.
 
 ```bash
-aws dynamodb create-table --table-name pawploy-deployments \
-  --attribute-definitions AttributeName=deploy_id,AttributeType=S \
-  --key-schema AttributeName=deploy_id,KeyType=HASH --billing-mode PAY_PER_REQUEST
-aws sqs create-queue --queue-name pawploy-destroy
-aws iam create-role --role-name pawploy-scheduler --assume-role-policy-document \
-  '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"scheduler.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
-aws iam put-role-policy --role-name pawploy-scheduler --policy-name send-destroy --policy-document \
-  '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sqs:SendMessage","Resource":"arn:aws:sqs:ap-northeast-2:<계정>:pawploy-destroy"}]}'
+bash infra/setup-aws.sh            # 무엇을 만들지 출력만 (이미 있는 것은 건너뜀)
+bash infra/setup-aws.sh --apply    # 실제로 생성 → 마지막에 워커 환경변수 값을 출력
 ```
 
 ---
@@ -280,6 +295,8 @@ modules/           기본 모듈 = AgentCore 가 고칠 베이스 (terraform_uri
   cloud_run/       Cloud Run v2 + 권한 없는 앱 전용 서비스 계정 + 공개 호출, 인스턴스 최대 1개
 examples/          작업 입력 예시 (job-ec2 / job-gcp / job-multi), 테스트용 sample-app
 tools/             fake-terraform.py, fake-aws.py (테스트용), push-sample-image.sh
+infra/setup-aws.sh 운영 인프라(S3·DynamoDB·SQS·Scheduler 역할) 생성 스크립트
+Dockerfile         워커 실행 이미지
 tests/             unittest (python -m unittest -v)
 work/<deploy_id>/  배포마다 생기는 작업 폴더 (git 제외): result.json + aws/ gcp/
 ```
@@ -290,7 +307,7 @@ work/<deploy_id>/  배포마다 생기는 작업 폴더 (git 제외): result.jso
 
 | 항목 | 상태 |
 |---|---|
-| 가짜 terraform·aws 로 27개 경로: 단일·멀티 클라우드, 한쪽 실패 후 그쪽만 재시도, 단계별 실패 보고·정리, AgentCore 모듈 사용·IaC 거부·정책 거부, 입력 오류, sweep·orphans 등 | ✅ |
+| 가짜 terraform·aws 로 32개 경로 (+ 입력 오류 기록, DynamoDB 잠금·결과 이어받기, 만료 큐 처리): 단일·멀티 클라우드, 한쪽 실패 후 그쪽만 재시도, 단계별 실패 보고·정리, AgentCore 모듈 사용·IaC 거부·정책 거부, 입력 오류, sweep·orphans 등 | ✅ |
 | 실제 terraform `validate` (EC2·Lambda·Cloud Run 루트+모듈) + `fmt` | ✅ (AWS provider 6.67, Google provider 6.50) |
 | 실제 AWS EC2 한 바퀴 (배포 → 접속 → 삭제) | ✅ 2026-10-02 (`targets` 구조로 바뀌기 전 코드) |
 | 실제 GCP Cloud Run 한 바퀴 (배포 → 접속 → 삭제) | ✅ 2026-10-02 (`softbankhackathon2026-peony`, 첫 시도 403 → 실패 보고·정리 → 권한 추가 후 같은 deploy_id 재시도 성공) |

@@ -9,11 +9,19 @@ Main Server 가 배포 상태를 읽어 화면에 보여 주고, `sweep` 이 다
     --key-schema AttributeName=deploy_id,KeyType=HASH --billing-mode PAY_PER_REQUEST
 
 항목 = result.json 내용 그대로 + project_id. 파티션 키는 deploy_id.
+같은 테이블에 배포 잠금 항목도 둔다: deploy_id = "lock#<deploy_id>", kind = "lock" (expires_at 이 없어 sweep 이 무시함).
+
+잠금이 필요한 이유: SQS 는 같은 메시지를 두 번 줄 수 있고, sweep·사용자 종료·재시도가 겹칠 수 있다.
+워커가 여러 대이면 로컬 result.json 만으로는 "이미 진행 중"을 알 수 없으므로 조건부 쓰기로 한 번에 하나만 돌게 한다.
+워커가 중간에 죽어도 잠금은 PAWPLOY_LOCK_LEASE_SEC(기본 3600초) 뒤에 풀린다.
 """
 import json
 import os
+import time
 
 from . import awscli
+
+LOCK_LEASE_SEC = int(os.environ.get("PAWPLOY_LOCK_LEASE_SEC") or 3600)
 
 # 리소스가 남아 있지 않다고 보는 상태 (render.REUSABLE_STATUSES 와 같은 기준)
 FINISHED_STATUSES = ("destroyed", "failed")
@@ -41,6 +49,54 @@ def put(result: dict, job: dict) -> None:
                    region=region(job.get("region") or os.environ.get("PAWPLOY_REGION", "ap-northeast-2")))
     except awscli.AwsError as e:
         print(f"[store] DynamoDB 기록 실패 (계속 진행): {e}", flush=True)
+
+
+def _region() -> str:
+    return region(os.environ.get("PAWPLOY_REGION", "ap-northeast-2"))
+
+
+def _key(deploy_id: str) -> str:
+    return json.dumps({"deploy_id": {"S": deploy_id}})
+
+
+def get(deploy_id: str) -> dict | None:
+    """DynamoDB 의 배포 결과 (다른 워커가 쓴 것 포함). 테이블이 없으면 None. 조회 실패는 AwsError."""
+    if not table() or awscli.offline():
+        return None
+    out = awscli.run("dynamodb", "get-item", "--table-name", table(), "--key", _key(deploy_id),
+                     "--consistent-read", region=_region())
+    return from_attr({"M": out["Item"]}) if out.get("Item") else None
+
+
+def acquire_lock(deploy_id: str, owner: str) -> bool:
+    """배포 잠금. 다른 작업이 잡고 있으면 False. 테이블이 없으면(로컬 전용 모드) 항상 True."""
+    if not table() or awscli.offline():
+        return True
+    now = int(time.time())
+    item = {"deploy_id": {"S": f"lock#{deploy_id}"}, "kind": {"S": "lock"}, "owner": {"S": owner},
+            "lease_until": {"N": str(now + LOCK_LEASE_SEC)}}
+    try:
+        awscli.run("dynamodb", "put-item", "--table-name", table(), "--item", json.dumps(item),
+                   "--condition-expression", "attribute_not_exists(deploy_id) OR lease_until < :now",
+                   "--expression-attribute-values", json.dumps({":now": {"N": str(now)}}), region=_region())
+        return True
+    except awscli.AwsError as e:
+        if "ConditionalCheckFailed" in str(e):
+            return False
+        raise
+
+
+def release_lock(deploy_id: str, owner: str) -> None:
+    """내가 잡은 잠금만 푼다. 실패해도 임대 시간이 지나면 풀리므로 로그만 남긴다."""
+    if not table() or awscli.offline():
+        return
+    try:
+        awscli.run("dynamodb", "delete-item", "--table-name", table(), "--key", _key(f"lock#{deploy_id}"),
+                   "--condition-expression", "#o = :me",
+                   "--expression-attribute-names", json.dumps({"#o": "owner"}),
+                   "--expression-attribute-values", json.dumps({":me": {"S": owner}}), region=_region())
+    except awscli.AwsError as e:
+        print(f"[store] 잠금 해제 실패 (임대 시간 뒤 자동 해제): {e}", flush=True)
 
 
 def list_expired(now_iso: str, default_region: str) -> list[dict]:

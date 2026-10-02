@@ -5,6 +5,7 @@
   python -m tfworker status <deploy_id>              # 결과 보기 (Main Server 에 돌려줄 내용)
   python -m tfworker sweep [--dry-run]               # 만료된 배포 찾아 삭제 (5~10분마다 정기 실행용)
   python -m tfworker orphans [region]                # 태그로 만료 지난 AWS 리소스 찾기 (알림만, 있으면 exit 1)
+  python -m tfworker drain-destroy-queue [queue_url]  # 만료 예약(SQS) 메시지를 모두 받아 destroy (정기 실행용)
 
 Terraform 은 AgentCore 가 만들어 S3 에 둔다(18~19단계). 워커는 사용자가 승인한 클라우드(target)마다
 AI 없이 항상 같은 순서로 검증하고 실행한다.
@@ -16,11 +17,16 @@ AI 없이 항상 같은 순서로 검증하고 실행한다.
 실패하면 어느 단계든: 앱 로그 수집 → 만든 리소스 정리 → failed 로 보고 (22: failed_stage·log_tail·current_state).
 Main Server 가 AgentCore 에 수정을 맡긴 뒤(23~25) 같은 deploy_id 로 다시 요청하면 빈 상태에서 다시 배포한다.
 AWS·GCP 를 함께 배포하다 한쪽이 실패해도 성공한 쪽은 그대로 둔다 (전체 상태 partial).
+
+PAWPLOY_STATUS_TABLE 이 있으면 deploy·destroy 는 deploy_id 단위 DynamoDB 잠금을 잡고, 다른 워커가 남긴 결과를
+이어받은 뒤 진행한다 (워커 여러 대·SQS 중복 메시지 대비). 입력 오류도 결과에 남긴다 (status=rejected / last_rejection).
 """
 import json
 import os
+import re
 import sys
 import time
+import uuid
 from pathlib import Path
 
 from . import artifacts, awscli, diagnose, expire, health, iac, image, policy, recommendation, store
@@ -86,24 +92,105 @@ def write_target(job: dict, cloud: str, reset: bool = False, **fields) -> dict:
     return result
 
 
+def _sync_from_store(deploy_id: str) -> dict:
+    """다른 워커가 DynamoDB 에 남긴 결과가 더 새로우면 로컬 result.json 으로 가져온다 (컨테이너가 바뀌어도 이어서 진행)."""
+    item = store.get(deploy_id)
+    local = load_result(deploy_id)
+    if item and isinstance(item.get("targets"), dict) and item.get("updated_at", "") > local.get("updated_at", ""):
+        path = render.workdir_for(deploy_id) / "result.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(item, indent=2, ensure_ascii=False), encoding="utf-8")
+        return load_result(deploy_id)
+    return local
+
+
+def _reject(raw, e: Exception) -> int:
+    """21단계 입력 오류 (종료 코드 2). deploy_id 를 알 수 있으면 결과에도 남겨 Main Server 가 이유를 읽게 한다."""
+    print(f"[worker] 입력 오류: {e}")
+    deploy_id = str(raw.get("deploy_id") or "").lower() if isinstance(raw, dict) else ""
+    if not jobmod.ID_RE.match(deploy_id):
+        return 2
+    owner = uuid.uuid4().hex
+    try:
+        if store.acquire_lock(deploy_id, owner):   # 다른 작업이 결과를 쓰는 중이면 덮어쓰지 않도록 기록 생략
+            try:
+                _sync_from_store(deploy_id)
+                _record_rejection(deploy_id, str(raw.get("project_id") or ""), e)
+            finally:
+                store.release_lock(deploy_id, owner)
+    except awscli.AwsError as err:
+        print(f"[worker] 입력 오류 기록 실패: {err}")
+    return 2
+
+
+def _record_rejection(deploy_id: str, project_id: str, e: Exception) -> None:
+    """기존 배포가 있으면 상태는 그대로 두고 last_rejection 만, 없으면 status=rejected 결과를 만든다."""
+    now = time.strftime(TIME_FORMAT, time.gmtime())
+    rejection = {"error": str(e), "at": now}
+    result = load_result(deploy_id)
+    if result.get("targets"):
+        result["last_rejection"] = rejection
+    else:
+        result = {"deploy_id": deploy_id, "project_id": project_id, "status": "rejected", "targets": {},
+                  "error": str(e)}
+    result["updated_at"] = now
+    path = render.workdir_for(deploy_id) / "result.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    store.put(result, {"project_id": result.get("project_id") or project_id})
+
+
+def _clear_rejection(deploy_id: str) -> None:
+    """요청이 받아들여지면 이전 거부 기록(error / last_rejection)을 지운다."""
+    result = load_result(deploy_id)
+    if "last_rejection" in result or result.get("status") == "rejected":
+        result.pop("last_rejection", None)
+        result.pop("error", None)
+        path = render.workdir_for(deploy_id) / "result.json"
+        path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 # ---------------- deploy (21 → 26 → 27, 실패 시 22) ----------------
 
 def deploy(job_path: str) -> int:
+    raw = None
     try:
         # utf-8-sig: Windows 도구(PowerShell 5.1, 메모장)가 붙이는 BOM 이 있어도 읽는다
         raw = json.loads(Path(job_path).read_text(encoding="utf-8-sig"))
         if raw.get("recommendation_uri"):
             raw = recommendation.merge(raw, recommendation.load(raw["recommendation_uri"]))
         job = jobmod.validate(raw)
-        previous = load_result(job["deploy_id"])
+    except (ValueError, OSError, awscli.AwsError) as e:
+        return _reject(raw, e)
+
+    owner = uuid.uuid4().hex
+    try:
+        locked = store.acquire_lock(job["deploy_id"], owner)
+    except awscli.AwsError as e:
+        print(f"[worker] 입력 오류: 상태 저장소(DynamoDB)에 접근할 수 없어 진행하지 않습니다: {e}")
+        return 2
+    if not locked:
+        print(f"[worker] 입력 오류: 같은 deploy_id 의 다른 작업이 진행 중입니다: {job['deploy_id']}")
+        return 2
+    try:
+        return _deploy_locked(job)
+    finally:
+        store.release_lock(job["deploy_id"], owner)
+
+
+def _deploy_locked(job: dict) -> int:
+    try:
+        previous = _sync_from_store(job["deploy_id"])
         for t in job["targets"]:   # 살아 있는 배포 위에 덮어쓰지 않는다
             st = previous.get("targets", {}).get(t["cloud"], {}).get("status")
             if st not in REUSABLE_TARGET_STATUSES:
                 raise jobmod.JobError(f"이미 사용 중인 deploy_id 입니다: {job['deploy_id']} ({t['cloud']} status={st}). "
                                       f"먼저 destroy 하거나 실패한 클라우드만 다시 요청하세요")
-    except (ValueError, OSError, awscli.AwsError) as e:
+    except (ValueError, awscli.AwsError) as e:
         print(f"[worker] 입력 오류: {e}")
+        _record_rejection(job["deploy_id"], job["project_id"], e)
         return 2
+    _clear_rejection(job["deploy_id"])
 
     # 다른 클라우드가 아직 살아 있으면 만료 시각을 그대로 둔다 (재시도로 1시간 제한이 늘어나지 않게)
     if any(t.get("status") not in REUSABLE_TARGET_STATUSES for t in previous.get("targets", {}).values()):
@@ -212,6 +299,22 @@ def _state_list(wd: Path) -> list[str]:
 # ---------------- destroy ----------------
 
 def destroy(deploy_id: str, cloud: str | None = None) -> int:
+    owner = uuid.uuid4().hex
+    try:
+        locked = store.acquire_lock(deploy_id, owner)
+    except awscli.AwsError as e:
+        print(f"[worker] 상태 저장소(DynamoDB)에 접근할 수 없어 삭제를 미룹니다: {e}")
+        return 1
+    if not locked:
+        print(f"[worker] 같은 deploy_id 의 다른 작업이 진행 중이라 삭제를 미룹니다: {deploy_id} (다음 점검에서 다시 시도)")
+        return 1
+    try:
+        return _destroy_locked(deploy_id, cloud)
+    finally:
+        store.release_lock(deploy_id, owner)
+
+
+def _destroy_locked(deploy_id: str, cloud: str | None) -> int:
     root = render.workdir_for(deploy_id)
     if not any(root.glob("*/job.json")):
         try:
@@ -223,7 +326,11 @@ def destroy(deploy_id: str, cloud: str | None = None) -> int:
         print(f"[worker] 배포를 찾을 수 없습니다: {deploy_id}{'/' + cloud if cloud else ''}")
         return 2
 
-    result = load_result(deploy_id)
+    try:
+        result = _sync_from_store(deploy_id)
+    except awscli.AwsError as e:
+        print(f"[worker] DynamoDB 결과를 읽지 못해 로컬 결과로 진행합니다: {e}")
+        result = load_result(deploy_id)
     all_ok = True
     for wd in dirs:
         tjob = json.loads((wd / "job.json").read_text(encoding="utf-8"))
@@ -283,6 +390,47 @@ def sweep(dry_run: bool) -> int:
     return 0
 
 
+def drain_destroy_queue(queue_url: str | None) -> int:
+    """만료 예약(EventBridge Scheduler → SQS) 메시지를 큐가 빌 때까지 받아 destroy 한다. 정기 실행(sweep 과 함께) 용.
+
+    성공하거나 지울 배포가 없으면(종료 코드 0·2) 메시지를 지운다. 실패하면 남겨 두어 visibility timeout 뒤 다시 받는다
+    (sweep 이 같은 배포를 따로 잡아도 destroy 는 여러 번 해도 안전하다).
+    """
+    queue_url = queue_url or os.environ.get("PAWPLOY_DESTROY_QUEUE_URL")
+    if not queue_url:
+        print("[queue] 큐 주소가 없습니다 (인자 또는 PAWPLOY_DESTROY_QUEUE_URL)")
+        return 2
+    m = re.match(r"https://sqs\.([a-z0-9-]+)\.amazonaws\.com/", queue_url)
+    region = m.group(1) if m else expire.DEFAULT_REGION
+    handled = failed = 0
+    while True:
+        out = awscli.run("sqs", "receive-message", "--queue-url", queue_url, "--max-number-of-messages", "10",
+                         "--wait-time-seconds", "1", "--visibility-timeout", "1800", region=region)
+        messages = out.get("Messages") or []
+        if not messages:
+            break
+        for msg in messages:
+            try:
+                body = json.loads(msg["Body"])
+                deploy_id = body["deploy_id"] if body.get("action") == "destroy" else None
+            except (ValueError, KeyError, TypeError):
+                deploy_id = None
+            if not deploy_id or not jobmod.ID_RE.match(str(deploy_id)):
+                print(f"[queue] 알 수 없는 메시지 → 삭제: {msg.get('Body', '')[:200]}")
+                rc = 0
+            else:
+                print(f"[queue] 만료 destroy 요청: {deploy_id}")
+                rc = destroy(deploy_id)
+            if rc in (0, 2):
+                awscli.run("sqs", "delete-message", "--queue-url", queue_url,
+                           "--receipt-handle", msg["ReceiptHandle"], region=region)
+                handled += 1
+            else:
+                failed += 1
+    print(f"[queue] 처리 {handled}건, 재시도 대기 {failed}건")
+    return 1 if failed else 0
+
+
 def orphans(region: str) -> int:
     """pawploy 태그가 붙었는데 만료 시각이 지난 리소스를 찾아 보여 준다. 지우지는 않는다. (AWS 만)"""
     try:
@@ -303,6 +451,8 @@ def main(argv: list[str]) -> int:
     cmd, args = (argv[0] if argv else None), argv[1:]
     if cmd == "sweep" and not set(args) - {"--dry-run"}:
         return sweep("--dry-run" in args)
+    if cmd == "drain-destroy-queue" and len(args) <= 1:
+        return drain_destroy_queue(args[0] if args else None)
     if cmd == "orphans" and len(args) <= 1:
         return orphans(args[0] if args else expire.DEFAULT_REGION)
     if cmd == "destroy" and len(args) in (1, 2) and (len(args) == 1 or args[1] in jobmod.CLOUD_ARCHITECTURES):

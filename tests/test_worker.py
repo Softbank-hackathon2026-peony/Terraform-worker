@@ -127,8 +127,13 @@ class WorkerFlowTest(unittest.TestCase):
     def aws_env(self, **extra) -> dict:
         """가짜 aws CLI 를 쓰는 환경 (PAWPLOY_OFFLINE 을 꺼서 AWS 호출 단계가 실제로 돌게 함)."""
         self.aws_log = self.tmp / "aws.jsonl"
+        self.aws_db, self.aws_sqs = self.tmp / "dynamodb.json", self.tmp / "sqs.json"
         return {"PAWPLOY_OFFLINE": "", "AWS_BIN": _fake_bin(self.tmp, FAKE_AWS, "aws"),
-                "FAKE_AWS_LOG": str(self.aws_log), **extra}
+                "FAKE_AWS_LOG": str(self.aws_log), "FAKE_AWS_DB": str(self.aws_db),
+                "FAKE_AWS_SQS": str(self.aws_sqs), **extra}
+
+    def db(self) -> dict:
+        return json.loads(self.aws_db.read_text(encoding="utf-8")) if self.aws_db.exists() else {}
 
     def aws_calls(self, service: str, op: str) -> list[list[str]]:
         if not self.aws_log.exists():
@@ -494,7 +499,10 @@ locals {
             self.assertIn(excluded, sync[0])
 
         puts = self.aws_calls("dynamodb", "put-item")
-        statuses = [json.loads(c[c.index("--item") + 1])["status"]["S"] for c in puts]
+        items = [json.loads(c[c.index("--item") + 1]) for c in puts]
+        statuses = [i["status"]["S"] for i in items if "status" in i]   # 잠금 항목(kind=lock)은 제외
+        self.assertTrue(any(i.get("kind") == {"S": "lock"} for i in items), "배포 중에는 잠금을 잡아야 함")
+        self.assertNotIn("lock#dep-test-ec2", self.db(), "끝나면 잠금을 풀어야 함")
         self.assertEqual(statuses[0], "deploying")
         self.assertEqual(statuses[-1], "running")
         last = json.loads(puts[-1][puts[-1].index("--item") + 1])
@@ -592,6 +600,88 @@ locals {
         gcp = self.write_targets([{"cloud": "gcp", "image_uri": GCP_IMAGE}], name="gcp.json", deploy_id="dep-gcp")
         self.assertEqual(self.run_worker("deploy", gcp, **sched)[0], 0)
         self.assertNotIn("aws_scheduler_schedule", (self.tdir("gcp", "dep-gcp") / "main.tf").read_text(encoding="utf-8"))
+
+    # ---------- 연동: 입력 오류 기록 · 잠금 · 결과 이어받기 · 만료 큐 ----------
+
+    def test_input_error_is_recorded_for_main_server(self):
+        code, out = self.run_worker("deploy", self.write_job(size="xlarge"))
+        self.assertEqual(code, 2, out)
+        r = self.result()
+        self.assertEqual((r["status"], r["targets"]), ("rejected", {}))
+        self.assertIn("허용되지 않는 크기", r["error"])
+
+        code, out = self.run_worker("deploy", self.write_job())
+        self.assertEqual(code, 0, out)
+        r = self.result()
+        self.assertEqual(r["status"], "running")
+        self.assertNotIn("error", r, "받아들여진 뒤에는 이전 거부 기록이 남으면 안 됨")
+
+    def test_rejection_of_active_deploy_keeps_its_status(self):
+        job = self.write_job()
+        self.assertEqual(self.run_worker("deploy", job)[0], 0)
+        self.assertEqual(self.run_worker("deploy", job)[0], 2)
+        r = self.result()
+        self.assertEqual(r["status"], "running", "거부 기록이 살아 있는 배포 상태를 덮으면 안 됨")
+        self.assertIn("이미 사용 중인 deploy_id", r["last_rejection"]["error"])
+        self.assertEqual(self.target()["status"], "running")
+
+    def test_lock_blocks_concurrent_work_until_lease_expires(self):
+        env = self.aws_env(PAWPLOY_STATUS_TABLE="t")
+        held = {"deploy_id": {"S": "lock#dep-test-ec2"}, "kind": {"S": "lock"}, "owner": {"S": "other-worker"},
+                "lease_until": {"N": str(int(time.time()) + 600)}}
+        self.aws_db.write_text(json.dumps({"lock#dep-test-ec2": held}), encoding="utf-8")
+
+        code, out = self.run_worker("deploy", self.write_job(), **env)
+        self.assertEqual(code, 2, out)
+        self.assertIn("다른 작업이 진행 중", out)
+        self.assertFalse((self.work / "dep-test-ec2").exists(), "잠금을 못 잡으면 아무것도 하지 않음")
+        self.assertEqual(self.run_worker("destroy", "dep-test-ec2", **env)[0], 1, "삭제도 다음 점검으로 미룸")
+
+        # 잡고 있던 워커가 죽어 임대 시간이 지났으면 이어서 진행
+        held["lease_until"] = {"N": str(int(time.time()) - 1)}
+        self.aws_db.write_text(json.dumps({"lock#dep-test-ec2": held}), encoding="utf-8")
+        code, out = self.run_worker("deploy", self.write_job(), **env)
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("lock#dep-test-ec2", self.db())
+        self.assertEqual(self.db()["dep-test-ec2"]["status"], {"S": "running"})
+
+    def test_new_worker_resumes_result_from_dynamodb(self):
+        # 컨테이너가 바뀌어 로컬 work/ 가 없어도, DynamoDB 결과를 이어받아 실패한 클라우드만 재시도해야 함
+        env = self.aws_env(PAWPLOY_STATUS_TABLE="t")
+        targets = [{"cloud": "aws", "architecture": "ec2", "image_uri": AWS_IMAGE},
+                   {"cloud": "gcp", "image_uri": GCP_IMAGE}]
+        code, out = self.run_worker("deploy", self.write_targets(targets), FAKE_TF_FAIL="apply",
+                                    FAKE_TF_FAIL_CLOUD="gcp", **env)
+        self.assertEqual(code, 1, out)
+        first_expiry = self.result("dep-multi")["expires_at"]
+        shutil.rmtree(self.work)   # 새 컨테이너
+
+        code, out = self.run_worker("deploy", self.write_targets(targets, name="again.json"), **env)
+        self.assertEqual(code, 2, out)
+        self.assertIn("aws status=running", out, "다른 워커가 띄운 AWS 도 살아 있는 것으로 알아야 함")
+
+        code, out = self.run_worker("deploy", self.write_targets([targets[1]], name="retry.json"), **env)
+        self.assertEqual(code, 0, out)
+        item = self.db()["dep-multi"]
+        self.assertEqual(item["status"], {"S": "running"})
+        self.assertEqual(set(item["targets"]["M"]), {"aws", "gcp"}, "AWS 결과가 사라지면 안 됨")
+        self.assertEqual(item["expires_at"], {"S": first_expiry})
+
+    def test_drain_destroy_queue_destroys_expired_and_drops_bad_messages(self):
+        env = self.aws_env()
+        self.assertEqual(self.run_worker("deploy", self.write_job(), **env)[0], 0)
+        self.aws_sqs.write_text(json.dumps([
+            json.dumps({"action": "destroy", "deploy_id": "dep-test-ec2", "project_id": "prj_test"}),
+            "not json",
+        ]), encoding="utf-8")
+
+        code, out = self.run_worker("drain-destroy-queue",
+                                    "https://sqs.ap-northeast-2.amazonaws.com/123456789012/pawploy-destroy", **env)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.result()["status"], "destroyed")
+        deletes = self.aws_calls("sqs", "delete-message")
+        self.assertEqual(len(deletes), 2, "처리한 메시지와 잘못된 메시지 모두 지움")
+        self.assertIn("ap-northeast-2", deletes[0], "리전은 큐 주소에서")
 
     def test_dynamodb_attr_roundtrip(self):
         sys.path.insert(0, str(ROOT))
