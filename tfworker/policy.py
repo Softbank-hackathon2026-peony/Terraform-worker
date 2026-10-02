@@ -6,7 +6,7 @@
   우리 계정에 배포하므로 비용·악용 방지의 마지막 방어선이다.
 
 검사 항목
-  - 리소스 종류: 아키텍처별 허용 목록 밖이면 거부
+  - 리소스 종류: 아키텍처별 허용 목록 밖이면 거부 (random_password 는 ec2_compose 만)
   - 변경 종류: 배포 중에는 delete 가 있으면 안 됨 (살아 있는 다른 리소스를 건드리는 신호)
   - EC2 인스턴스 타입 / Lambda 메모리·타임아웃 상한
   - 보안 그룹 인바운드는 80 번 포트만
@@ -20,14 +20,17 @@
 AgentCore 가 만든 Terraform 도 같은 검사를 거친다. 실행 전 정적 검사는 iac.py.
 """
 
+EC2_TYPES = {
+    "aws_security_group",
+    "aws_iam_role",
+    "aws_iam_role_policy_attachment",
+    "aws_iam_instance_profile",
+    "aws_instance",
+}
 ALLOWED_TYPES = {
-    "ec2": {
-        "aws_security_group",
-        "aws_iam_role",
-        "aws_iam_role_policy_attachment",
-        "aws_iam_instance_profile",
-        "aws_instance",
-    },
+    "ec2": EC2_TYPES,
+    # 여러 컨테이너(Docker Compose): EC2 와 같은 리소스 + 데이터 저장소 컨테이너 비밀번호(클라우드 리소스 아님, 비용 없음)
+    "ec2_compose": EC2_TYPES | {"random_password"},
     "lambda": {
         "aws_iam_role",
         "aws_iam_role_policy_attachment",

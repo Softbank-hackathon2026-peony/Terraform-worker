@@ -1,0 +1,48 @@
+# Pawploy ec2_compose 예시 템플릿 (기본 모듈용). 실제 배포에서는 AgentCore 코드가 deploy_units 로 앱마다 렌더한다.
+#
+# 모듈 main.tf 가 Terraform 템플릿으로 렌더한다 (local.compose). 쓸 수 있는 값:
+#   $${images["<이미지 id>"]}        digest 고정 ECR 주소 (작업 입력 targets[].images 의 키)
+#   $${passwords["<비밀번호 id>"]}   영문·숫자 24자. id 마다 random_password 하나 (같은 id 는 같은 값)
+# 규칙:
+#   - 진입(entry) 컨테이너만 호스트 80번에 연다: ports: ["80:<entry 컨테이너 포트>"]. 다른 호스트 포트는 열지 않음
+#   - 값에 글자 그대로의 달러+중괄호·퍼센트+중괄호가 있으면 $$ / %% 로 한 번 더 적는다 (Terraform 템플릿 문법과 겹침)
+#   - build, privileged, host 네트워크·PID, Docker 소켓 마운트, cap_add, devices 는 쓰지 않는다 (워커가 거부)
+name: app
+
+services:
+  app:
+    image: "${images["app"]}"
+    restart: unless-stopped
+    ports:
+      - "80:8080"
+    environment:
+      PORT: "8080"
+      DATABASE_URL: "postgresql://app:${passwords["postgres"]}@postgres:5432/app"
+      REDIS_URL: "redis://redis:6379/0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: "${passwords["postgres"]}"
+      POSTGRES_DB: app
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+
+volumes:
+  postgres-data:

@@ -1,0 +1,15 @@
+{
+  "deploy_id": "dep-demo-compose",
+  "project_id": "prj_demo",
+  "size": "medium",
+  "health_path": "/",
+  "targets": [
+    {
+      "cloud": "aws",
+      "architecture": "ec2_compose",
+      "images": {
+        "app": "123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/pawploy-sample:latest"
+      }
+    }
+  ]
+}

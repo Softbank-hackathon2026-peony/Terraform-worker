@@ -18,35 +18,65 @@ import shutil
 from pathlib import Path
 
 from . import awscli
-from .job import CLOUD_ARCHITECTURES, DEFAULT_ARCHITECTURE
+from .job import (CLOUD_ARCHITECTURES, DEFAULT_ARCHITECTURE, DEFAULT_MULTI_IMAGE_ARCHITECTURE,
+                  MULTI_IMAGE_ARCHITECTURES)
 
 ROOT = Path(__file__).resolve().parent.parent
 MODULES = ROOT / "modules"
 WORK = Path(os.environ.get("PAWPLOY_WORK_DIR", ROOT / "work"))
 
-MODULE_CALL = """
-variable "project_id" {{ type = string }}
-variable "deploy_id" {{ type = string }}
-variable "expires_at" {{ type = string }}
-variable "image_uri" {{ type = string }}
-variable "container_port" {{ type = number }}
-variable "size" {{ type = string }}
-variable "health_path" {{ type = string }}
-variable "env" {{ type = map(string) }}
+OUTPUTS = """
+output "endpoint" { value = module.app.endpoint }
+output "health_url" { value = module.app.health_url }
+output "resource_id" { value = module.app.resource_id }
+"""
 
-module "app" {{
+# 모듈 호출. 모듈 입력은 아키텍처에 따라 두 가지다 (iac.CONTRACT_VARIABLES / COMPOSE_CONTRACT_VARIABLES 와 같아야 함)
+MODULE_CALL = """
+variable "project_id" { type = string }
+variable "deploy_id" { type = string }
+variable "expires_at" { type = string }
+variable "image_uri" { type = string }
+variable "container_port" { type = number }
+variable "size" { type = string }
+variable "health_path" { type = string }
+variable "env" { type = map(string) }
+
+module "app" {
   source         = "./modules/app"
-  name           = "pawploy-${{var.deploy_id}}"
+  name           = "pawploy-${var.deploy_id}"
   image_uri      = var.image_uri
   container_port = var.container_port
   size           = var.size
   env            = var.env
   health_path    = var.health_path
-}}
+}
+""" + OUTPUTS
 
-output "endpoint" {{ value = module.app.endpoint }}
-output "health_url" {{ value = module.app.health_url }}
-output "resource_id" {{ value = module.app.resource_id }}
+# 여러 컨테이너(ec2_compose): image_uri 하나 대신 images(이미지 id → digest 고정 ECR 주소).
+# 포트·환경변수는 AgentCore 가 렌더한 모듈 안의 compose.yaml.tftpl 에 들어 있으므로 넘기지 않는다
+COMPOSE_MODULE_CALL = """
+variable "project_id" { type = string }
+variable "deploy_id" { type = string }
+variable "expires_at" { type = string }
+variable "images" { type = map(string) }
+variable "size" { type = string }
+variable "health_path" { type = string }
+
+module "app" {
+  source      = "./modules/app"
+  name        = "pawploy-${var.deploy_id}"
+  images      = var.images
+  size        = var.size
+  health_path = var.health_path
+}
+""" + OUTPUTS
+
+# ec2_compose 모듈의 random_password(데이터 저장소 비밀번호)용. 모듈은 provider 를 정할 수 없으므로 루트에서 고정
+RANDOM_PROVIDER = """    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.6"
+    }
 """
 
 AWS_MAIN_TF = """\
@@ -58,7 +88,7 @@ terraform {{
       source  = "hashicorp/aws"
       version = "~> 6.28" # aws_lambda_permission.invoked_via_function_url 이 6.28.0 부터
     }}
-  }}
+{extra_providers}  }}
 }}
 
 provider "aws" {{
@@ -74,7 +104,7 @@ provider "aws" {{
 }}
 
 variable "region" {{ type = string }}
-""" + MODULE_CALL + "{scheduler}"
+{module_call}{scheduler}"""
 
 GCP_MAIN_TF = """\
 terraform {{
@@ -99,7 +129,7 @@ provider "google" {{
 variable "gcp_project" {{ type = string }}
 variable "region" {{ type = string }}
 variable "labels" {{ type = map(string) }}
-""" + MODULE_CALL
+{module_call}"""
 
 # 만료 시각에 destroy 요청을 보내는 예약 (expire.py 의 1번 그물). AWS target 이고 환경변수가 둘 다 있을 때만.
 # 큐와 역할은 팀 계정에 한 번만 만들어 둔다 (역할: scheduler.amazonaws.com 신뢰 + 그 큐에 sqs:SendMessage).
@@ -129,6 +159,12 @@ resource "aws_scheduler_schedule" "expire" {
 
 TFVAR_KEYS = ("region", "project_id", "deploy_id", "expires_at", "image_uri",
               "container_port", "size", "health_path", "env")
+COMPOSE_TFVAR_KEYS = ("region", "project_id", "deploy_id", "expires_at", "images", "size", "health_path")
+
+
+def module_call(architecture: str) -> str:
+    """루트 main.tf 의 변수 선언 + module "app" 호출 + 출력."""
+    return COMPOSE_MODULE_CALL if architecture in MULTI_IMAGE_ARCHITECTURES else MODULE_CALL
 
 
 def workdir_for(deploy_id: str) -> Path:
@@ -167,17 +203,20 @@ def render(tjob: dict) -> Path:
         tjob["region"] if tjob["cloud"] == "aws" else os.environ.get("PAWPLOY_REGION", "ap-northeast-2"))
     backend = '  backend "s3" {}\n' if tjob["state_bucket"] else ""
 
-    tfvars = {k: tjob[k] for k in TFVAR_KEYS}
+    multi_image = tjob["architecture"] in MULTI_IMAGE_ARCHITECTURES
+    tfvars = {k: tjob[k] for k in (COMPOSE_TFVAR_KEYS if multi_image else TFVAR_KEYS)}
     if tjob["cloud"] == "aws":
         # 만료 시각 destroy 예약: 큐·역할 ARN 이 둘 다 있을 때만 (없으면 sweep 정기 점검만으로 지운다)
         tjob["destroy_queue_arn"] = os.environ.get("PAWPLOY_DESTROY_QUEUE_ARN") or None
         tjob["scheduler_role_arn"] = os.environ.get("PAWPLOY_SCHEDULER_ROLE_ARN") or None
         scheduled = bool(tjob["destroy_queue_arn"] and tjob["scheduler_role_arn"])
-        main_tf = AWS_MAIN_TF.format(backend=backend, scheduler=SCHEDULER_TF if scheduled else "")
+        main_tf = AWS_MAIN_TF.format(backend=backend, scheduler=SCHEDULER_TF if scheduled else "",
+                                     module_call=module_call(tjob["architecture"]),
+                                     extra_providers=RANDOM_PROVIDER if multi_image else "")
         if scheduled:
             tfvars.update(destroy_queue_arn=tjob["destroy_queue_arn"], scheduler_role_arn=tjob["scheduler_role_arn"])
     else:
-        main_tf = GCP_MAIN_TF.format(backend=backend)
+        main_tf = GCP_MAIN_TF.format(backend=backend, module_call=module_call(tjob["architecture"]))
         tfvars.update(gcp_project=tjob["gcp_project"], labels={
             "pawploy-managed": "true",
             "pawploy-project-id": gcp_label(tjob["project_id"]),
@@ -238,6 +277,8 @@ ARCHITECTURE_MARKERS = {
     "lambda": "aws_lambda_function",
     "cloud_run": "google_cloud_run_v2_service",
 }
+# aws_instance 모듈 중 이 파일이 있으면 여러 컨테이너(Docker Compose) 실행기 ec2_compose
+COMPOSE_TEMPLATE = "compose.yaml.tftpl"
 
 
 def detect_architecture(module_dir: Path) -> str | None:
@@ -246,7 +287,10 @@ def detect_architecture(module_dir: Path) -> str | None:
              if re.search(rf'^\s*resource\s+"{rtype}"\s+"', code, re.M)}
     if len(found) > 1:
         raise ModuleError(f"모듈 하나에 아키텍처가 여러 개입니다: {sorted(found)}")
-    return found.pop() if found else None
+    arch = found.pop() if found else None
+    if arch == "ec2" and (module_dir / COMPOSE_TEMPLATE).is_file():
+        return "ec2_compose"
+    return arch
 
 
 def resolve_architecture(tjob: dict, module_dir: Path) -> None:
@@ -261,10 +305,21 @@ def resolve_architecture(tjob: dict, module_dir: Path) -> None:
     tjob["architecture"] = arch
 
 
+def check_image_input(tjob: dict) -> None:
+    """정해진 아키텍처와 이미지 입력 모양이 맞는지: ec2_compose 는 images, 나머지는 image_uri."""
+    arch, multi = tjob["architecture"], bool(tjob.get("images"))
+    if arch in MULTI_IMAGE_ARCHITECTURES and not multi:
+        raise ModuleError(f"모듈 아키텍처 {arch} 는 images(이미지 id → ECR 주소)가 필요한데 입력은 image_uri 입니다: "
+                          f"{tjob['terraform_source']}")
+    if arch not in MULTI_IMAGE_ARCHITECTURES and multi:
+        raise ModuleError(f"모듈 아키텍처 {arch} 는 image_uri 하나만 받는데 입력은 images 입니다: {tjob['terraform_source']}")
+
+
 def fetch_module(tjob: dict, dst: Path) -> None:
     uri = module_uri(tjob)
     if not uri:
-        tjob["architecture"] = tjob.get("architecture") or DEFAULT_ARCHITECTURE[tjob["cloud"]]
+        tjob["architecture"] = tjob.get("architecture") or (
+            DEFAULT_MULTI_IMAGE_ARCHITECTURE if tjob.get("images") else DEFAULT_ARCHITECTURE[tjob["cloud"]])
     tjob["terraform_source"] = uri or f"modules/{tjob['architecture']}"
     if not uri:
         shutil.copytree(MODULES / tjob["architecture"], dst)
@@ -281,6 +336,7 @@ def fetch_module(tjob: dict, dst: Path) -> None:
     if uri:
         resolve_architecture(tjob, dst)
         print(f"[render] {tjob['cloud']}: 아키텍처 {tjob['architecture']}", flush=True)
+    check_image_input(tjob)
 
 
 def backend_args(tjob: dict) -> list[str]:
