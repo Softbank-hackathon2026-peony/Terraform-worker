@@ -206,6 +206,8 @@ GCP 배포에는 **서비스 계정 키**가 필요합니다. 서비스 계정 �
 
 1. 사용할 API 켜기: `run.googleapis.com`, `iam.googleapis.com`, `artifactregistry.googleapis.com`
 2. 워커용 서비스 계정에 역할 부여: **Cloud Run 관리자**(`roles/run.admin`), **서비스 계정 관리자**(`roles/iam.serviceAccountAdmin`, 앱 전용 계정 생성), **서비스 계정 사용자**(`roles/iam.serviceAccountUser`, 앱 계정으로 실행)
+   그리고 이미지 저장소 하나에 대해 **Artifact Registry 리더**(`roles/artifactregistry.reader`). Cloud Run 은 서비스를 만드는 계정에게 이미지 읽기 권한을 요구한다 (없으면 apply 에서 `artifactregistry.repositories.downloadArtifacts` 403):
+   `gcloud artifacts repositories add-iam-policy-binding <저장소> --location <리전> --member serviceAccount:<워커 계정> --role roles/artifactregistry.reader`
 3. 콘솔 → IAM 및 관리자 → 서비스 계정 → 해당 계정 → **키** → 키 추가 → JSON → 내려받기
 4. 워커를 실행하는 곳에서 경로 지정:
    ```powershell
@@ -291,7 +293,7 @@ work/<deploy_id>/  배포마다 생기는 작업 폴더 (git 제외): result.jso
 | 가짜 terraform·aws 로 27개 경로: 단일·멀티 클라우드, 한쪽 실패 후 그쪽만 재시도, 단계별 실패 보고·정리, AgentCore 모듈 사용·IaC 거부·정책 거부, 입력 오류, sweep·orphans 등 | ✅ |
 | 실제 terraform `validate` (EC2·Lambda·Cloud Run 루트+모듈) + `fmt` | ✅ (AWS provider 6.67, Google provider 6.50) |
 | 실제 AWS EC2 한 바퀴 (배포 → 접속 → 삭제) | ✅ 2026-10-02 (`targets` 구조로 바뀌기 전 코드) |
-| 실제 GCP Cloud Run 배포 | ❌ 서비스 계정 키 준비 후 |
+| 실제 GCP Cloud Run 한 바퀴 (배포 → 접속 → 삭제) | ✅ 2026-10-02 (`softbankhackathon2026-peony`, 첫 시도 403 → 실패 보고·정리 → 권한 추가 후 같은 deploy_id 재시도 성공) |
 | 실제 AWS·GCP 동시 배포, S3·DynamoDB·Scheduler 실제 호출 | ❌ |
 
 ## 다음 할 일

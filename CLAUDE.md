@@ -148,13 +148,16 @@ python -m tfworker orphans
   - 실제 terraform `validate`·`fmt` 통과: EC2·Lambda·Cloud Run (AWS provider 6.67, Google provider 6.50, deploy_id 40자)
   - 실제 terraform `plan` 으로 새 AWS 정책 검사(IAM 정책 허용 목록·크레딧) 통과 확인
   - **실제 AWS EC2 한 바퀴 성공** (`dep-demo-ec2b`, 249초) — 단, `targets` 구조로 바꾸기 전 코드
-- **아직 확인 안 된 것**: 바뀐 구조로 EC2 재확인, Lambda·Cloud Run 실제 배포, AWS+GCP 동시 실제 배포, Cloud Run plan JSON 의 실제 필드 형식(`terraform_labels`, `template[].scaling` — 가짜 plan 으로만 검증), S3·DynamoDB·Scheduler 실제 호출
+  - **실제 GCP Cloud Run 한 바퀴 성공** (`dep-demo-gcp`, 프로젝트 `softbankhackathon2026-peony`, 서울 리전 저장소 `pawploy`): 실제 plan JSON 으로 정책 검사 필드(`terraform_labels`·`template[].scaling`·`deletion_protection`) 확인 → 첫 apply 403 → 실패 보고·정리(`current_state: []`) → 권한 추가 후 같은 deploy_id 재시도 → `running`(헬스체크 200) → 앱 전용 계정 `pp-dep-demo-gcp` 로 실행 확인 → destroy 후 남은 리소스 없음
+- **아직 확인 안 된 것**: 바뀐 구조로 EC2 재확인, Lambda 실제 배포, AWS+GCP 동시 실제 배포, S3·DynamoDB·Scheduler 실제 호출
 - 해결된 의심 지점
   - `modules/lambda`: 인증 없는 함수 URL은 `lambda:InvokeFunctionUrl` + `lambda:InvokeFunction`(`invoked_via_function_url`) 둘 다 필요
   - `modules/ec2` 기본 VPC: 인터넷 게이트웨이가 지워져 경로가 `blackhole`이었음 → `default-vpc-igw` 연결로 해결. EC2 헬스체크가 `URLError`만 반복하면 이것부터 확인
   - IAM `name_prefix` 는 `substr(var.name, 0, 37)` (38 이면 deploy_id 30자 이상에서 plan 실패)
   - Cloud Run `deletion_protection` 기본값이 true 라 그대로 두면 destroy 가 실패함 → 모듈·검사에서 false 강제
   - Cloud Run 에 `PORT` 환경변수를 직접 넣으면 거부됨 (Cloud Run 이 container_port 로 자동 설정)
+  - Cloud Run 생성 시 **워커 계정에 이미지 저장소 읽기 권한**(`roles/artifactregistry.reader`, 저장소 단위)이 필요. 없으면 apply 403 (`artifactregistry.repositories.downloadArtifacts`)
+  - GCP 인증 키: `C:\keys\pawploy-worker.json` (저장소 밖). 사용자 환경변수에는 아직 등록 안 됨 → 실행 시 `GOOGLE_APPLICATION_CREDENTIALS` 지정 필요
 
 ---
 
@@ -162,7 +165,7 @@ python -m tfworker orphans
 
 1. [x] terraform·AWS CLI 설치·로그인, 샘플 이미지 ECR 푸시, EC2 한 바퀴 (2026-10-02)
 2. [ ] **바뀐 구조(targets)로 EC2 한 바퀴 재확인** ← 다음 최우선
-3. [ ] GCP 서비스 계정 키 준비 → 샘플 이미지 Artifact Registry 푸시 → Cloud Run 한 바퀴
+3. [x] GCP 서비스 계정 키 준비 → 샘플 이미지 Artifact Registry 푸시 → Cloud Run 한 바퀴 (2026-10-02)
 4. [ ] AWS + GCP 동시 한 바퀴, Lambda 한 바퀴 (Lambda 전에 Web Adapter 1.1.0 으로 이미지 다시 빌드)
 5. [ ] AgentCore 담당과 모듈 약속(README "AgentCore 가 만들 Terraform 모듈") 확정, S3 경로 규칙 정하기
 6. [ ] Main Server와 연결 방식 결정 (SQS / CodeBuild / ECS 작업). **Lambda에서 실행은 비추천** (15분 제한). destroy 큐 소비자도 함께
