@@ -137,9 +137,9 @@ terraform -chdir=work/<deploy_id>/<cloud> init -backend=false && terraform -chdi
 | `project_id` | ✅ | 태그·state 경로에 쓰임 |
 | `targets` | ✅ | 승인된 클라우드마다 하나 (최대 AWS 1 + GCP 1) |
 | `targets[].cloud` | ✅ | `aws` / `gcp` |
-| `targets[].architecture` | | AWS: `ec2`·`lambda`(필수), GCP: `cloud_run`(기본값) |
+| `targets[].architecture` | | **생략 가능.** AgentCore 모듈의 대표 리소스로 워커가 판단(`aws_instance`→`ec2`, `aws_lambda_function`→`lambda`, `google_cloud_run_v2_service`→`cloud_run`). 넘기면 모듈과 다를 때 `generating` 실패. 모듈이 없으면 AWS `ec2`·GCP `cloud_run` 기본 모듈 |
 | `targets[].image_uri` | ✅ | AWS: ECR 주소(태그면 워커가 digest 로 고정). GCP: Artifact Registry 주소 + **`@sha256:` digest 필수** |
-| `targets[].terraform_uri` | | AgentCore 가 저장한 모듈 위치. 없으면 저장소의 기본 모듈(`modules/<architecture>`) 사용 |
+| `targets[].terraform_uri` | | **보통 생략.** 없으면 `PAWPLOY_AGENT_BUCKET` 의 `projects/<project_id>/deploy/<deploy_id>/attempt-<N>/<cloud>/` 중 최신 attempt. 그것도 없으면 기본 모듈(`modules/<architecture>`) |
 | `targets[].region` | | AWS: 생략하면 ECR 주소의 리전(Lambda 는 같아야 함). GCP: 생략하면 Artifact Registry 리전 |
 | `targets[].gcp_project` | | 생략하면 Artifact Registry 주소의 프로젝트 |
 | `container_port`, `size`, `health_path`, `env` | | 기본 8080 / `small`(`micro`·`small`·`medium`) / `/` / `{}`. 모든 클라우드에 같이 적용 |

@@ -13,7 +13,9 @@
     ]
   }
 
-terraform_uri 는 AgentCore 가 만든 모듈(18~19단계)의 위치. 없으면 저장소의 기본 모듈(modules/<architecture>)을 쓴다.
+architecture 는 생략 가능 (AgentCore 모듈에 들어 있는 리소스로 워커가 판단). 넘기면 모듈과 다를 때 실패로 보고한다.
+terraform_uri 는 AgentCore 가 만든 모듈(18~19단계)의 위치. 보통 생략하고 PAWPLOY_AGENT_BUCKET 규칙
+(projects/<project_id>/deploy/<deploy_id>/attempt-<N>/<cloud>/)에서 최신 attempt 를 쓴다. 둘 다 없으면 기본 모듈.
 targets 없이 architecture·image_uri 를 최상위에 두면 AWS target 하나로 본다 (이전 입력 형식).
 """
 import re
@@ -24,7 +26,7 @@ CLOUD_ARCHITECTURES = {                    # 지금 지원하는 클라우드별
     "aws": {"ec2", "lambda"},
     "gcp": {"cloud_run"},
 }
-DEFAULT_ARCHITECTURE = {"gcp": "cloud_run"}
+DEFAULT_ARCHITECTURE = {"aws": "ec2", "gcp": "cloud_run"}   # architecture 도 AgentCore 모듈도 없을 때 쓸 기본 모듈
 SIZES = {"micro", "small", "medium"}       # 허용 크기 (악용 방지: large 이상 없음)
 DEFAULT_TTL_MINUTES = 60                   # 1시간 뒤 자동 종료
 
@@ -110,8 +112,10 @@ def _target(t) -> dict:
     if cloud not in CLOUD_ARCHITECTURES:
         raise JobError(f"지원하지 않는 클라우드입니다: {cloud or '(없음)'} (가능: {sorted(CLOUD_ARCHITECTURES)})")
 
-    architecture = str(t.get("architecture") or DEFAULT_ARCHITECTURE.get(cloud, "")).lower()
-    if architecture not in CLOUD_ARCHITECTURES[cloud]:
+    # architecture 는 생략 가능: AgentCore 가 클라우드별 모듈의 아키텍처를 정하므로 워커가 모듈 코드에서 알아낸다
+    # (render.resolve_architecture). 넘겨 주면 모듈과 같은지 확인한다
+    architecture = str(t.get("architecture") or "").lower() or None
+    if architecture and architecture not in CLOUD_ARCHITECTURES[cloud]:
         raise JobError(f"{cloud} 에서 지원하지 않는 아키텍처입니다: {architecture or '(없음)'} "
                        f"(가능: {sorted(CLOUD_ARCHITECTURES[cloud])})")
 

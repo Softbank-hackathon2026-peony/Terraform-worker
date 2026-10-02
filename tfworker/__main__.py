@@ -239,7 +239,7 @@ def deploy_target(job: dict, tjob: dict) -> str:
         wd = render.render(tjob)
         iac.check(wd / "modules" / "app", cloud, tjob["architecture"])
 
-        step("init", terraform_source=tjob["terraform_source"])   # 어느 attempt 의 코드인지 (22단계 보고에 필요)
+        step("init", terraform_source=tjob["terraform_source"], architecture=tjob["architecture"])   # 어느 attempt 의 코드인지 (22단계 보고에 필요)
         tf.run(wd, "init", "-upgrade", *render.backend_args(tjob))
 
         step("plan")   # plan 결과를 정책(허용 리소스·크기·태그·IAM)으로 검사한 뒤에만 apply 한다
@@ -263,7 +263,7 @@ def deploy_target(job: dict, tjob: dict) -> str:
         interval = int(os.environ.get("PAWPLOY_HEALTH_INTERVAL") or 10)
         if not health.wait_healthy(health_url, timeout=timeout, interval=interval):
             raise HealthCheckFailed(f"{health_url} 이 {timeout}초 안에 응답하지 않음")
-    except (tf.TerraformError, awscli.AwsError, iac.IacError, policy.PolicyError,
+    except (tf.TerraformError, awscli.AwsError, iac.IacError, policy.PolicyError, render.ModuleError,
             HealthCheckFailed, KeyError, OSError) as e:
         return _fail(tjob, wd, stage, e, applied, resource_id)
 

@@ -18,6 +18,7 @@ import shutil
 from pathlib import Path
 
 from . import awscli
+from .job import CLOUD_ARCHITECTURES, DEFAULT_ARCHITECTURE
 
 ROOT = Path(__file__).resolve().parent.parent
 MODULES = ROOT / "modules"
@@ -190,6 +191,10 @@ def render(tjob: dict) -> Path:
     return wd
 
 
+class ModuleError(Exception):
+    """AgentCore 모듈을 쓸 수 없음 (파일 없음·아키텍처 불일치 등) → generating 단계 실패로 보고."""
+
+
 ATTEMPT_RE = re.compile(r"attempt-(\d+)/$")
 
 
@@ -227,8 +232,39 @@ def module_uri(tjob: dict) -> str | None:
     return uri
 
 
+# 아키텍처를 알려 주는 대표 리소스 (모듈 하나에 하나만 있어야 한다)
+ARCHITECTURE_MARKERS = {
+    "ec2": "aws_instance",
+    "lambda": "aws_lambda_function",
+    "cloud_run": "google_cloud_run_v2_service",
+}
+
+
+def detect_architecture(module_dir: Path) -> str | None:
+    code = "\n".join(f.read_text(encoding="utf-8", errors="replace") for f in sorted(module_dir.glob("*.tf")))
+    found = {arch for arch, rtype in ARCHITECTURE_MARKERS.items()
+             if re.search(rf'^\s*resource\s+"{rtype}"\s+"', code, re.M)}
+    if len(found) > 1:
+        raise ModuleError(f"모듈 하나에 아키텍처가 여러 개입니다: {sorted(found)}")
+    return found.pop() if found else None
+
+
+def resolve_architecture(tjob: dict, module_dir: Path) -> None:
+    """AgentCore 모듈의 아키텍처를 정한다. 입력에 있으면 모듈과 같은지 확인하고, 없으면 모듈에서 알아낸다."""
+    given, detected = tjob.get("architecture"), detect_architecture(module_dir)
+    if given and detected and given != detected:
+        raise ModuleError(f"입력 architecture={given} 와 AgentCore 모듈({detected})이 다릅니다: {tjob['terraform_source']}")
+    arch = given or detected
+    if arch not in CLOUD_ARCHITECTURES[tjob["cloud"]]:
+        raise ModuleError(f"{tjob['cloud']} 모듈의 아키텍처를 알 수 없습니다 "
+                           f"(대표 리소스 {sorted(ARCHITECTURE_MARKERS.values())} 중 하나가 필요): {tjob['terraform_source']}")
+    tjob["architecture"] = arch
+
+
 def fetch_module(tjob: dict, dst: Path) -> None:
     uri = module_uri(tjob)
+    if not uri:
+        tjob["architecture"] = tjob.get("architecture") or DEFAULT_ARCHITECTURE[tjob["cloud"]]
     tjob["terraform_source"] = uri or f"modules/{tjob['architecture']}"
     if not uri:
         shutil.copytree(MODULES / tjob["architecture"], dst)
@@ -237,11 +273,14 @@ def fetch_module(tjob: dict, dst: Path) -> None:
         dst.mkdir(parents=True)
         awscli.run("s3", "sync", uri, str(dst), "--only-show-errors", json_output=False)
         if not any(dst.glob("*.tf")):
-            raise RuntimeError(f"AgentCore 모듈에 .tf 파일이 없습니다: {uri}")
+            raise ModuleError(f"AgentCore 모듈에 .tf 파일이 없습니다: {uri}")
         print(f"[render] {tjob['cloud']}: AgentCore 모듈 {uri}", flush=True)
     else:
         shutil.copytree(uri, dst)
         print(f"[render] {tjob['cloud']}: 로컬 모듈 {uri}", flush=True)
+    if uri:
+        resolve_architecture(tjob, dst)
+        print(f"[render] {tjob['cloud']}: 아키텍처 {tjob['architecture']}", flush=True)
 
 
 def backend_args(tjob: dict) -> list[str]:

@@ -344,6 +344,37 @@ class WorkerFlowTest(unittest.TestCase):
         self.assertEqual(self.target()["terraform_source"],
                          "s3://agentbkt/projects/prj_test/deploy/dep-test-ec2/attempt-10/")
 
+    def test_agentcore_multi_cloud_architecture_comes_from_module(self):
+        """Main 은 클라우드만 넘기고(architecture 생략), 아키텍처는 AgentCore 모듈(attempt-N/<cloud>/)에서 알아낸다."""
+        deploy_dir = self.tmp / "s3" / "agentbkt" / "projects" / "prj_test" / "deploy" / "dep-multi"
+        for n in (1, 2):
+            shutil.copytree(self.module_dir("lambda"), deploy_dir / f"attempt-{n}" / "aws")
+            shutil.copytree(self.module_dir("cloud_run"), deploy_dir / f"attempt-{n}" / "gcp")
+        env = self.aws_env(PAWPLOY_AGENT_BUCKET="agentbkt", FAKE_AWS_S3_ROOT=str(self.tmp / "s3"))
+        job = self.write_targets([
+            {"cloud": "aws", "image_uri": "123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/pawploy-sample:latest"},
+            {"cloud": "gcp", "image_uri": GCP_IMAGE},
+        ])
+        code, out = self.run_worker("deploy", job, **env)
+        self.assertEqual(code, 0, out)
+        for cloud, arch in (("aws", "lambda"), ("gcp", "cloud_run")):
+            t = self.target(cloud, "dep-multi")
+            self.assertEqual((t["status"], t["architecture"]), ("running", arch))
+            self.assertTrue(t["terraform_source"].endswith(f"/attempt-2/{cloud}/"), t["terraform_source"])
+            saved = json.loads((self.tdir(cloud, "dep-multi") / "job.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved["architecture"], arch, "destroy 도 같은 아키텍처로 처리하도록 job.json 에 기록")
+
+    def test_agentcore_module_architecture_mismatch_is_reported(self):
+        deploy_dir = self.tmp / "s3" / "agentbkt" / "projects" / "prj_test" / "deploy" / "dep-test-ec2"
+        shutil.copytree(self.module_dir("lambda"), deploy_dir / "attempt-1" / "aws")
+        env = self.aws_env(PAWPLOY_AGENT_BUCKET="agentbkt", FAKE_AWS_S3_ROOT=str(self.tmp / "s3"))
+        code, out = self.run_worker("deploy", self.write_job(), **env)   # 입력은 ec2, 모듈은 lambda
+        self.assertEqual(code, 1, out)
+        t = self.target()
+        self.assertEqual((t["status"], t["failed_stage"]), ("failed", "generating"))
+        self.assertIn("architecture=ec2", t["error"])
+        self.assertTrue(t["terraform_source"].endswith("/attempt-1/aws/"))
+
     def test_agentcore_bucket_cloud_subfolder_and_missing_attempts(self):
         root = self.tmp / "s3" / "agentbkt" / "projects" / "prj_test" / "deploy"
         shutil.copytree(self.module_dir("ec2", "\n# aws-sub\n"), root / "dep-test-ec2" / "attempt-1" / "aws")
