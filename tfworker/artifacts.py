@@ -11,7 +11,7 @@ from pathlib import Path
 from . import awscli
 
 # state는 S3 backend가 따로 관리하고, 나머지는 실행할 때마다 다시 생기는 파일이다
-EXCLUDES = [".terraform/*", "tfplan", "*.tfstate", "*.tfstate.*", "result.json", "diagnosis_*.json"]
+EXCLUDES = [".terraform/*", "tfplan", "plan.json", "*.tfstate", "*.tfstate.*", "result.json", "diagnosis_*.json"]
 
 
 def bucket() -> str | None:

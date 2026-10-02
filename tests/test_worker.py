@@ -148,6 +148,54 @@ class WorkerFlowTest(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertEqual(self.result()["status"], "running")
 
+    def test_policy_violation_blocks_apply(self):
+        # plan 에 허용 밖 인스턴스 타입 / 리소스 종류가 있으면 apply 전에 failed 로 끝나야 하고, destroy 는 돌지 않는다
+        cases = {
+            "instance_type": dict(FAKE_TF_INSTANCE_TYPE="t3.xlarge"),
+            "resource_type": dict(FAKE_TF_EXTRA_RESOURCE="aws_s3_bucket"),
+        }
+        for name, env in cases.items():
+            with self.subTest(case=name):
+                code, out = self.run_worker("deploy", self.write_job(deploy_id=f"dep-pol-{name.replace('_', '-')}"), **env)
+                self.assertEqual(code, 1, out)
+                r = self.result(f"dep-pol-{name.replace('_', '-')}")
+                self.assertEqual(r["status"], "failed")
+                self.assertIn("plan 정책 위반", r["error"])
+                self.assertNotIn("destroyed", r)
+                self.assertNotIn("Apply complete", out, "정책 위반이면 apply 가 실행되면 안 됨")
+
+    def test_policy_unit_checks(self):
+        sys.path.insert(0, str(ROOT))
+        from tfworker import policy
+
+        def plan(*changes):
+            return {"resource_changes": list(changes)}
+
+        def change(rtype, after=None, actions=("create",), mode="managed"):
+            return {"address": f"module.app.{rtype}.x", "mode": mode, "type": rtype,
+                    "change": {"actions": list(actions), "after": after or {}}}
+
+        ok_tags = {"tags_all": {t: "v" for t in policy.REQUIRED_TAGS}}
+        self.assertEqual(policy.find_violations(plan(change("aws_instance", {"instance_type": "t3.micro", **ok_tags})), "ec2"), [])
+        self.assertEqual(policy.find_violations(plan(change("aws_vpc", mode="data")), "ec2"), [], "data 소스는 무시")
+        self.assertEqual(policy.find_violations(plan(change("aws_instance", actions=("no-op",))), "ec2"), [])
+
+        v = policy.find_violations(plan(
+            change("aws_instance", {"instance_type": "m5.large", "tags_all": {"pawploy:managed": "true"}}),
+            change("aws_lambda_function", {"memory_size": 4096, "timeout": 900}),   # ec2 배포에 Lambda 는 허용 밖
+            change("aws_security_group", {"ingress": [{"from_port": 22, "to_port": 22}], **ok_tags}),
+            change("aws_iam_role", actions=("delete",)),
+        ), "ec2")
+        joined = "\n".join(v)
+        self.assertIn("인스턴스 타입 m5.large", joined)
+        self.assertIn("필수 태그 누락", joined)
+        self.assertIn("허용하지 않는 리소스 종류 aws_lambda_function", joined)
+        self.assertIn("인바운드 포트 22-22", joined)
+        self.assertIn("삭제", joined)
+
+        v = policy.find_violations(plan(change("aws_lambda_function", {"memory_size": 4096, "timeout": 900, **ok_tags})), "lambda")
+        self.assertEqual(len(v), 2, v)
+
     def test_input_errors_return_2(self):
         cases = {
             "size": dict(size="xlarge"),

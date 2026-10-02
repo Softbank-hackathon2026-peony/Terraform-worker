@@ -19,7 +19,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import artifacts, awscli, diagnose, health, image, recommendation
+from . import artifacts, awscli, diagnose, health, image, policy, recommendation
 from . import job as jobmod, render, terraform as tf
 
 HEALTH_TIMEOUT = {"ec2": 420, "lambda": 180}   # EC2는 부팅 + Docker 설치 시간이 필요
@@ -81,15 +81,18 @@ def deploy(job_path: str) -> int:
         # 4단계: 생성된 코드 S3 보관 (apply 전에 해야 실패해도 같은 코드로 지울 수 있음)
         artifacts.upload(job, wd)
 
-        # 5단계: 적용
+        # 5단계: 적용. plan 결과를 정책(허용 리소스·크기·태그)으로 검사한 뒤에만 apply 한다
         write_result(job, status="plan")
         tf.run(wd, "plan", "-out=tfplan")
+        plan = tf.run(wd, "show", "-json", "tfplan", capture_json=True)
+        (wd / "plan.json").write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+        policy.check(plan, job["architecture"])
 
         write_result(job, status="apply")
         applied = True
         tf.run(wd, "apply", "-auto-approve", "tfplan")
         out = tf.run(wd, "output", "-json", capture_json=True)
-    except (tf.TerraformError, awscli.AwsError) as e:
+    except (tf.TerraformError, awscli.AwsError, policy.PolicyError) as e:
         result = write_result(job, status="failed", error=str(e),
                               log_tail=getattr(e, "output", "")[-4000:])
         _diagnose(job, wd, result)

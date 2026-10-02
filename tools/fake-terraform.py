@@ -12,13 +12,55 @@
   output  → endpoint / health_url / resource_id JSON
 
 환경변수
-  FAKE_TF_FAIL      init | plan | apply | destroy 중 하나. 그 단계에서 exit 1 로 실패한다
-  FAKE_TF_ENDPOINT  output 의 endpoint (기본 http://127.0.0.1:9 → 연결 거부 → unhealthy 경로)
+  FAKE_TF_FAIL            init | plan | apply | destroy 중 하나. 그 단계에서 exit 1 로 실패한다
+  FAKE_TF_ENDPOINT        output 의 endpoint (기본 http://127.0.0.1:9 → 연결 거부 → unhealthy 경로)
+  FAKE_TF_INSTANCE_TYPE   show -json 이 돌려주는 EC2 인스턴스 타입 (기본 t3.small, 정책 위반 시험용)
+  FAKE_TF_EXTRA_RESOURCE  show -json 에 추가로 끼워 넣을 리소스 종류 (예: aws_s3_bucket, 정책 위반 시험용)
 """
 import json
 import os
 import sys
 from pathlib import Path
+
+TAGS = {"pawploy:managed": "true", "pawploy:project_id": "prj", "pawploy:deploy_id": "dep", "pawploy:expires_at": "x"}
+
+
+def _change(address: str, rtype: str, after: dict, tagged: bool = True) -> dict:
+    if tagged:
+        after = {**after, "tags_all": TAGS}
+    return {"address": address, "mode": "managed", "type": rtype, "name": address.rsplit(".", 1)[-1],
+            "change": {"actions": ["create"], "before": None, "after": after}}
+
+
+def _fake_plan(workdir: Path) -> dict:
+    """실제 모듈(modules/ec2, modules/lambda)이 만드는 리소스와 같은 종류·속성을 가진 plan JSON."""
+    architecture = "ec2"
+    job_file = workdir / "job.json"
+    if job_file.exists():
+        architecture = json.loads(job_file.read_text(encoding="utf-8")).get("architecture", "ec2")
+
+    if architecture == "lambda":
+        changes = [
+            _change("module.app.aws_iam_role.app", "aws_iam_role", {}),
+            _change("module.app.aws_iam_role_policy_attachment.logs", "aws_iam_role_policy_attachment", {}, tagged=False),
+            _change("module.app.aws_lambda_function.app", "aws_lambda_function", {"memory_size": 1024, "timeout": 30}),
+            _change("module.app.aws_lambda_function_url.app", "aws_lambda_function_url", {}, tagged=False),
+            _change("module.app.aws_lambda_permission.public_url", "aws_lambda_permission", {}, tagged=False),
+        ]
+    else:
+        changes = [
+            _change("module.app.aws_security_group.app", "aws_security_group",
+                    {"ingress": [{"from_port": 80, "to_port": 80, "protocol": "tcp"}]}),
+            _change("module.app.aws_iam_role.app", "aws_iam_role", {}),
+            _change("module.app.aws_iam_role_policy_attachment.ecr_read", "aws_iam_role_policy_attachment", {}, tagged=False),
+            _change("module.app.aws_iam_instance_profile.app", "aws_iam_instance_profile", {}),
+            _change("module.app.aws_instance.app", "aws_instance",
+                    {"instance_type": os.environ.get("FAKE_TF_INSTANCE_TYPE", "t3.small")}),
+        ]
+    extra = os.environ.get("FAKE_TF_EXTRA_RESOURCE")
+    if extra:
+        changes.append(_change(f"{extra}.extra", extra, {}))
+    return {"format_version": "1.2", "terraform_version": "9.9.9-fake", "resource_changes": changes}
 
 
 def main(argv: list[str]) -> int:
@@ -52,6 +94,9 @@ def main(argv: list[str]) -> int:
     elif cmd == "plan":
         (workdir / "tfplan").write_bytes(b"fake-plan")
         print("Plan: 7 to add, 0 to change, 0 to destroy. (fake)")
+    elif cmd == "show":
+        # `show -json tfplan` → 정책 검사(policy.py)가 읽는 plan JSON. 실제 모듈이 만드는 리소스를 흉내 낸다
+        print(json.dumps(_fake_plan(workdir)))
     elif cmd == "apply":
         state.write_text(json.dumps({"version": 4, "fake": True,
                                      "resources": [{"type": "aws_instance", "name": "app"}]}), encoding="utf-8")
