@@ -459,6 +459,16 @@ locals {
         self.assertEqual(self.run_worker("destroy", "dep-gcp")[0], 0)
         self.assertEqual(self.result("dep-gcp")["status"], "destroyed")
 
+    def test_gcp_results_go_to_status_table_region(self):
+        """GCP 배포·삭제 결과도 상태 테이블(서울)에 기록돼야 한다 (GCP 리전 asia-northeast3 로 DynamoDB 를 부르면 실패)."""
+        env = self.aws_env(PAWPLOY_STATUS_TABLE="t", PAWPLOY_REGION="ap-northeast-2")
+        job = self.write_targets([{"cloud": "gcp", "image_uri": GCP_IMAGE}], deploy_id="dep-gcp")
+        self.assertEqual(self.run_worker("deploy", job, **env)[0], 0)
+        self.assertEqual(self.run_worker("destroy", "dep-gcp", **env)[0], 0)
+        calls = [json.loads(l) for l in self.aws_log.read_text(encoding="utf-8").splitlines()]
+        regions = {c[c.index("--region") + 1] for c in calls if c[0] == "dynamodb" and "--region" in c}
+        self.assertEqual(regions, {"ap-northeast-2"})
+
     def test_multi_cloud_partial_failure_keeps_success_and_retries_failed_only(self):
         targets = [{"cloud": "aws", "architecture": "ec2", "image_uri": AWS_IMAGE},
                    {"cloud": "gcp", "image_uri": GCP_IMAGE}]

@@ -46,7 +46,7 @@ def put(result: dict, job: dict) -> None:
     try:
         awscli.run("dynamodb", "put-item", "--table-name", table(),
                    "--item", json.dumps(to_attr(item)["M"], ensure_ascii=False),
-                   region=region(job.get("region") or os.environ.get("PAWPLOY_REGION", "ap-northeast-2")))
+                   region=_region())   # 상태 테이블은 한 곳(서울). 배포 리전(GCP 는 asia-northeast3 등)과 무관
     except awscli.AwsError as e:
         print(f"[store] DynamoDB 기록 실패 (계속 진행): {e}", flush=True)
 
