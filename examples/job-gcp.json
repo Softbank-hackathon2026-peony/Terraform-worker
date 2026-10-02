@@ -1,0 +1,15 @@
+{
+  "deploy_id": "dep-demo-gcp",
+  "project_id": "prj_demo",
+  "container_port": 8080,
+  "size": "small",
+  "health_path": "/",
+  "env": { "APP_MODE": "test" },
+  "targets": [
+    {
+      "cloud": "gcp",
+      "architecture": "cloud_run",
+      "image_uri": "asia-northeast3-docker.pkg.dev/my-gcp-project/pawploy/pawploy-sample@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ]
+}

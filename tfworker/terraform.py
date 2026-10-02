@@ -14,7 +14,7 @@ class TerraformError(RuntimeError):
         self.output = output
 
 
-def run(workdir: Path, *args: str, capture_json: bool = False):
+def run(workdir: Path, *args: str, capture_json: bool = False, capture_text: bool = False):
     if shutil.which(TERRAFORM) is None:
         raise TerraformError(args, 127, "", message="terraform 실행 파일을 찾을 수 없습니다. "
                              "설치 후 PATH에 추가하거나 TERRAFORM_BIN을 지정하세요")
@@ -23,10 +23,12 @@ def run(workdir: Path, *args: str, capture_json: bool = False):
     env = {**os.environ, "TF_IN_AUTOMATION": "1", "TF_INPUT": "0"}
     print(f"[tf] $ terraform {' '.join(args)}", flush=True)
 
-    if capture_json:
+    if capture_json or capture_text:
         p = subprocess.run(cmd, env=env, capture_output=True, text=True, encoding="utf-8")
         if p.returncode != 0:
             raise TerraformError(args, p.returncode, p.stderr)
+        if capture_text:
+            return p.stdout
         try:
             return json.loads(p.stdout or "{}")
         except ValueError:

@@ -1,0 +1,12 @@
+.git
+.venv
+work
+tests
+tools
+examples
+**/__pycache__
+**/.terraform
+*.tfstate
+*.tfstate.*
+*.json
+!modules/**/*.json

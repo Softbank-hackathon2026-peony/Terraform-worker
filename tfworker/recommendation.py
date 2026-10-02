@@ -18,7 +18,8 @@ def load(uri: str) -> dict:
         text = awscli.run("s3", "cp", uri, "-", json_output=False)
     else:
         text = Path(uri).read_text(encoding="utf-8")
-    data = json.loads(text)
+    # Windows 도구가 붙이는 BOM 은 S3·로컬 어느 쪽에서 읽어도 맨 앞에 남으므로 떼어 낸다
+    data = json.loads(text.lstrip("﻿"))
     if not isinstance(data, dict):
         raise JobError("추천 결과는 JSON 객체여야 합니다")
     return data
