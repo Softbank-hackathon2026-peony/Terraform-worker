@@ -163,7 +163,9 @@ python -m tfworker orphans
   - **바뀐 구조(targets)로 EC2 한 바퀴 재확인 성공** (`dep-demo-ec2c`): ECR 태그 → digest 고정 → IaC 검사 → plan 정책 검사(5개) → apply → 헬스체크 200(121초) → 접속 확인 → destroy(5개), 남은 EC2·IAM 역할 없음
   - **실제 GCP Cloud Run 한 바퀴 성공** (`dep-demo-gcp`, 프로젝트 `softbankhackathon2026-peony`, 서울 리전 저장소 `pawploy`): 실제 plan JSON 으로 정책 검사 필드(`terraform_labels`·`template[].scaling`·`deletion_protection`) 확인 → 첫 apply 403 → 실패 보고·정리(`current_state: []`) → 권한 추가 후 같은 deploy_id 재시도 → `running`(헬스체크 200) → 앱 전용 계정 `pp-dep-demo-gcp` 로 실행 확인 → destroy 후 남은 리소스 없음
 - **SQS + Fargate 워커 가동 (2026-10-02, 이미지 6b2389e)**: 서비스 실행, maintenance(만료 큐·DynamoDB scan) 동작, S3 작업 JSON → 큐 메시지 → 입력 오류 거부 → DynamoDB `status=rejected` → 메시지 삭제·작업 보호 켜고 끄기 확인 (`dep-queue-test`)
-- **아직 확인 안 된 것**: Fargate 워커로 실제 배포(EC2·Cloud Run), Lambda 실제 배포, AWS+GCP 동시 실제 배포, Scheduler 만료 예약 실제 동작
+- **Fargate 워커로 실제 배포 + 1시간 자동 삭제 (2026-10-02~03)**: `dep-fargate-ec2`(Excalidraw EC2) 큐 메시지 → running(273초) → 만료 시각 Scheduler → 만료 큐 → 워커 destroy(약 50초 뒤 시작, 2분 만에 destroyed), 남은 리소스·예약 없음
+- **실제 파이프라인 산출물로 AWS+GCP 동시 배포 성공 (`dep-test-1`, prj_test)**: AgentCore 분석값 + CodeBuild(pawploy-build) 이미지(ECR `pawploy-apps@sha256:757c…`, AR `pawploy/pawploy-apps@sha256:c0d7…`) + AgentCore `attempt-1/{aws,gcp}` → Fargate 워커가 최신 attempt 자동 선택 → **Lambda running(116초)**, **Cloud Run running(68초)**, 두 주소 모두 HTTP 200 (Lambda 첫 실제 배포)
+- **아직 확인 안 된 것**: 실패 → AgentCore fix_terraform → attempt-2 재시도 한 바퀴, 3d612ae(아키텍처 자동 판단) Fargate 반영
 - 해결된 의심 지점
   - `modules/lambda`: 인증 없는 함수 URL은 `lambda:InvokeFunctionUrl` + `lambda:InvokeFunction`(`invoked_via_function_url`) 둘 다 필요
   - `modules/ec2` 기본 VPC: 인터넷 게이트웨이가 지워져 경로가 `blackhole`이었음 → `default-vpc-igw` 연결로 해결. EC2 헬스체크가 `URLError`만 반복하면 이것부터 확인
@@ -180,7 +182,7 @@ python -m tfworker orphans
 1. [x] terraform·AWS CLI 설치·로그인, 샘플 이미지 ECR 푸시, EC2 한 바퀴 (2026-10-02)
 2. [x] 바뀐 구조(targets)로 EC2 한 바퀴 재확인 (2026-10-02)
 3. [x] GCP 서비스 계정 키 준비 → 샘플 이미지 Artifact Registry 푸시 → Cloud Run 한 바퀴 (2026-10-02)
-4. [ ] AWS + GCP 동시 한 바퀴, Lambda 한 바퀴 (Lambda 전에 Web Adapter 1.1.0 으로 이미지 다시 빌드)
+4. [x] AWS + GCP 동시 한 바퀴, Lambda 한 바퀴 (2026-10-03 `dep-test-1`)
 5. [ ] AgentCore 담당과 모듈 약속(README "AgentCore 가 만들 Terraform 모듈") 확정, S3 경로 규칙 정하기
 6. [ ] Main Server와 연결 방식 결정 (SQS / CodeBuild / ECS 작업). **Lambda에서 실행은 비추천** (15분 제한). 사용자가 Main 담당과 논의 중
    - [x] 연결 방식과 무관한 준비 (2026-10-02): 입력 오류 기록, DynamoDB 잠금·결과 이어받기, 만료 큐 소비자(`drain-destroy-queue`), 워커 컨테이너 이미지(컨테이너 안에서 GCP plan 확인)
