@@ -77,6 +77,7 @@ claude.ai에서 나눈 설계 대화를 정리한 컨텍스트입니다. 작업 
 }
 ```
 
+- **AgentCore 모듈 위치 (2026-10-02 AgentCore 담당과 확인)**: 버킷 `pawploy-agent-<계정>`, `projects/<project_id>/deploy/<deploy_id>/attempt-<N>/main.tf`. `terraform_uri` 가 없으면 워커가 `PAWPLOY_AGENT_BUCKET` 에서 **N 이 가장 큰 attempt** 를 고른다(숫자 비교, `attempt-N/<cloud>/` 가 있으면 그 폴더, 없으면 기본 모듈). 쓴 위치는 `targets.<cloud>.terraform_source` 로 결과·실패 보고에 남김. 멀티 클라우드 때 attempt 폴더 안을 클라우드별로 나눌지는 미정
 - `targets` 없이 `architecture`·`image_uri` 를 최상위에 두면 AWS 하나 (이전 형식, `examples/job-ec2.json`)
 - GCP 이미지는 digest 필수(워커에 gcloud 없음). GCP 프로젝트·리전은 Artifact Registry 주소에서 추출
 - 살아 있는 클라우드를 다시 보내면 거부(종료 코드 2). 재시도는 `failed`·`destroyed` 클라우드만, 만료 시각은 처음 것 유지

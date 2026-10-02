@@ -244,6 +244,7 @@ GCP 배포에는 **서비스 계정 키**가 필요합니다. 서비스 계정 �
 | `PAWPLOY_STATE_BUCKET` | 지정하면 state를 S3에 저장 (`deployments/<project_id>/<deploy_id>/<cloud>.tfstate`, S3 네이티브 잠금). 없으면 작업 폴더에 로컬 저장 |
 | `PAWPLOY_STATE_REGION` | state 버킷 리전 (기본: AWS 는 배포 리전, GCP 는 `PAWPLOY_REGION`) |
 | `PAWPLOY_ARTIFACT_BUCKET` | 지정하면 작업 폴더를 `workdirs/<deploy_id>/<cloud>/`에 보관. 로컬에 없으면 destroy 때 여기서 받음 |
+| `PAWPLOY_AGENT_BUCKET` | AgentCore 버킷. `terraform_uri` 가 없으면 `s3://<버킷>/projects/<project_id>/deploy/<deploy_id>/attempt-<N>/` 에서 **N 이 가장 큰** 폴더의 모듈을 씀(숫자 비교). `attempt-N/<cloud>/` 가 있으면 그 폴더. 하나도 없으면 기본 모듈. 쓴 위치는 결과의 `targets.<cloud>.terraform_source` |
 | `PAWPLOY_STATUS_TABLE` | 지정하면 결과를 DynamoDB 에도 기록 (파티션 키 `deploy_id`). `sweep` 이 다른 머신의 배포도 찾는 근거 |
 | `PAWPLOY_STATUS_REGION` | 상태 테이블 리전 (기본 `PAWPLOY_REGION`) |
 | `PAWPLOY_DESTROY_QUEUE_ARN`, `PAWPLOY_SCHEDULER_ROLE_ARN` | 둘 다 있으면 AWS target 에 EventBridge Scheduler 예약을 함께 만듦 |

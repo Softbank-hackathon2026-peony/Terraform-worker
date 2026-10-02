@@ -4,6 +4,7 @@
   py infra/setup_fargate.py --apply    # 실제로 생성 + 워커 이미지 빌드·푸시 + 서비스 배포
 
 구성
+  AgentCore 버킷             pawploy-agent-<계정> 의 projects/*/deploy/* 읽기만 (만들지 않음, 최신 attempt-N 을 워커가 고름)
   기본 (infra/setup-aws.sh)  S3 버킷 · DynamoDB 테이블 · 만료 큐 pawploy-destroy · Scheduler 역할 ppw-scheduler
   SQS FIFO                  pawploy-jobs.fifo (배포·삭제 요청) + pawploy-jobs-dlq.fifo (3회 실패 시)
   ECR                       pawploy-tf-worker (푸시 때 스캔, 최근 10개만 보관)
@@ -81,6 +82,8 @@ def run(cmd, **kw):
 
 ACCOUNT = aws("sts", "get-caller-identity")["Account"]
 BUCKET = os.environ.get("PAWPLOY_BUCKET", f"pawploy-tf-{ACCOUNT}-{REGION}")
+# AgentCore 가 Terraform 을 두는 버킷 (projects/<project_id>/deploy/<deploy_id>/attempt-<N>/). 워커는 읽기만
+AGENT_BUCKET = os.environ.get("PAWPLOY_AGENT_BUCKET", f"pawploy-agent-{ACCOUNT}")
 ARN = f"arn:aws:%s:{REGION}:{ACCOUNT}:%s"
 QUEUE_URL = lambda name: f"https://sqs.{REGION}.amazonaws.com/{ACCOUNT}/{name}"   # noqa: E731
 
@@ -126,6 +129,11 @@ def worker_task_policy(secret_arn: str | None) -> dict:
         {"Sid": "StateBucket", "Effect": "Allow", "Action": "s3:ListBucket", "Resource": f"arn:aws:s3:::{BUCKET}"},
         {"Sid": "StateObjects", "Effect": "Allow", "Resource": f"arn:aws:s3:::{BUCKET}/*",
          "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]},
+        {"Sid": "AgentModulesList", "Effect": "Allow", "Action": "s3:ListBucket",
+         "Resource": f"arn:aws:s3:::{AGENT_BUCKET}",
+         "Condition": {"StringLike": {"s3:prefix": "projects/*/deploy/*"}}},
+        {"Sid": "AgentModulesRead", "Effect": "Allow", "Action": "s3:GetObject",
+         "Resource": f"arn:aws:s3:::{AGENT_BUCKET}/projects/*/deploy/*"},
         {"Sid": "StatusTable", "Effect": "Allow", "Resource": ARN % ("dynamodb", f"table/{TABLE}"),
          "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:Scan"]},
         {"Sid": "Queues", "Effect": "Allow",
@@ -260,7 +268,7 @@ def main() -> None:
     print(f"[9] 작업 정의 {FAMILY} (0.5 vCPU / 2GB, consume)")
     env = {
         "PAWPLOY_REGION": REGION, "PAWPLOY_STATE_BUCKET": BUCKET, "PAWPLOY_ARTIFACT_BUCKET": BUCKET,
-        "PAWPLOY_STATUS_TABLE": TABLE, "PAWPLOY_JOBS_QUEUE_URL": QUEUE_URL(JOBS_QUEUE),
+        "PAWPLOY_STATUS_TABLE": TABLE, "PAWPLOY_AGENT_BUCKET": AGENT_BUCKET, "PAWPLOY_JOBS_QUEUE_URL": QUEUE_URL(JOBS_QUEUE),
         "PAWPLOY_DESTROY_QUEUE_ARN": ARN % ("sqs", DESTROY_QUEUE), "PAWPLOY_DESTROY_QUEUE_URL": QUEUE_URL(DESTROY_QUEUE),
         "PAWPLOY_SCHEDULER_ROLE_ARN": f"arn:aws:iam::{ACCOUNT}:role/{SCHED_ROLE}",
     }

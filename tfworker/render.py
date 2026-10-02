@@ -190,14 +190,54 @@ def render(tjob: dict) -> Path:
     return wd
 
 
-def fetch_module(tjob: dict, dst: Path) -> None:
+ATTEMPT_RE = re.compile(r"attempt-(\d+)/$")
+
+
+def _s3_subdirs(uri: str) -> list[str]:
+    """s3://버킷/경로/ 바로 아래 폴더 이름들 (끝에 / 포함)."""
+    bucket, _, prefix = uri[len("s3://"):].partition("/")
+    out = awscli.run("s3api", "list-objects-v2", "--bucket", bucket, "--prefix", prefix, "--delimiter", "/")
+    return [c["Prefix"][len(prefix):] for c in (out or {}).get("CommonPrefixes") or []]
+
+
+def module_uri(tjob: dict) -> str | None:
+    """AgentCore 모듈 위치를 정한다. None 이면 저장소 기본 모듈.
+
+    AgentCore 저장 규칙: s3://<PAWPLOY_AGENT_BUCKET>/projects/<project_id>/deploy/<deploy_id>/attempt-<N>/
+      - terraform_uri 가 없고 PAWPLOY_AGENT_BUCKET 이 있으면 위 규칙의 deploy 폴더에서 찾는다
+      - terraform_uri 가 attempt-N 상위 폴더(attempt-* 를 담은 폴더)면 그 안에서 찾는다
+      - N 이 가장 큰 attempt 를 쓴다 (숫자 비교: attempt-10 > attempt-9). 수정본(23~25)이 N+1 로 올라온다
+      - attempt-N/<cloud>/ 폴더가 있으면 그 폴더(멀티 클라우드), 없으면 attempt-N/ 자체
+    """
     uri = tjob.get("terraform_uri")
+    bucket = os.environ.get("PAWPLOY_AGENT_BUCKET")
+    if not uri and not bucket:
+        return None
+    if not uri:
+        uri = f"s3://{bucket}/projects/{tjob['project_id']}/deploy/{tjob['deploy_id']}/"
+    if uri.startswith("s3://") and not ATTEMPT_RE.search(uri):
+        attempts = [(int(m.group(1)), d) for d in _s3_subdirs(uri) if (m := ATTEMPT_RE.fullmatch(d))]
+        if attempts:
+            uri += max(attempts)[1]
+        elif not tjob.get("terraform_uri"):
+            print(f"[render] {tjob['cloud']}: {uri} 에 AgentCore 모듈이 없어 기본 모듈 사용", flush=True)
+            return None
+    if uri.startswith("s3://") and f"{tjob['cloud']}/" in _s3_subdirs(uri):
+        uri += f"{tjob['cloud']}/"
+    return uri
+
+
+def fetch_module(tjob: dict, dst: Path) -> None:
+    uri = module_uri(tjob)
+    tjob["terraform_source"] = uri or f"modules/{tjob['architecture']}"
     if not uri:
         shutil.copytree(MODULES / tjob["architecture"], dst)
         print(f"[render] {tjob['cloud']}: 기본 모듈 modules/{tjob['architecture']} 사용", flush=True)
     elif uri.startswith("s3://"):
         dst.mkdir(parents=True)
         awscli.run("s3", "sync", uri, str(dst), "--only-show-errors", json_output=False)
+        if not any(dst.glob("*.tf")):
+            raise RuntimeError(f"AgentCore 모듈에 .tf 파일이 없습니다: {uri}")
         print(f"[render] {tjob['cloud']}: AgentCore 모듈 {uri}", flush=True)
     else:
         shutil.copytree(uri, dst)

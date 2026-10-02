@@ -239,7 +239,7 @@ def deploy_target(job: dict, tjob: dict) -> str:
         wd = render.render(tjob)
         iac.check(wd / "modules" / "app", cloud, tjob["architecture"])
 
-        step("init")
+        step("init", terraform_source=tjob["terraform_source"])   # 어느 attempt 의 코드인지 (22단계 보고에 필요)
         tf.run(wd, "init", "-upgrade", *render.backend_args(tjob))
 
         step("plan")   # plan 결과를 정책(허용 리소스·크기·태그·IAM)으로 검사한 뒤에만 apply 한다
@@ -276,6 +276,8 @@ def _fail(tjob: dict, wd: Path | None, stage: str, e: Exception, applied: bool, 
     cloud = tjob["cloud"]
     error = f"출력 누락: {e}" if isinstance(e, KeyError) else str(e)
     report = {"failed_stage": stage, "error": error, "log_tail": getattr(e, "output", "")[-4000:]}
+    if tjob.get("terraform_source"):
+        report["terraform_source"] = tjob["terraform_source"]
     if stage == "health_check":
         report["app_log"] = diagnose.app_log(tjob, resource_id)   # 지우기 전에 앱 로그부터
     print(f"[worker] {cloud}: {stage} 단계 실패 → {error.splitlines()[0]}", flush=True)

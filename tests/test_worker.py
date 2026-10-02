@@ -331,6 +331,33 @@ class WorkerFlowTest(unittest.TestCase):
         self.assertIn("IaC 검사 위반", t["error"])
         self.assertNotIn("terraform init", out, "정적 검사에 걸리면 terraform 을 실행하지 않음")
 
+    def test_agentcore_bucket_latest_attempt_is_used(self):
+        """terraform_uri 없이 PAWPLOY_AGENT_BUCKET 규칙(projects/<p>/deploy/<d>/attempt-<N>)에서 N 이 가장 큰 것을 쓴다."""
+        deploy_dir = self.tmp / "s3" / "agentbkt" / "projects" / "prj_test" / "deploy" / "dep-test-ec2"
+        for n in (2, 9, 10):   # 숫자 비교여야 attempt-10 이 고름 (글자 비교면 attempt-9)
+            shutil.copytree(self.module_dir("ec2", f"\n# attempt-{n}\n"), deploy_dir / f"attempt-{n}")
+        env = self.aws_env(PAWPLOY_AGENT_BUCKET="agentbkt", FAKE_AWS_S3_ROOT=str(self.tmp / "s3"))
+        code, out = self.run_worker("deploy", self.write_job(), **env)
+        self.assertEqual(code, 0, out)
+        used = (self.tdir() / "modules" / "app" / "main.tf").read_text(encoding="utf-8")
+        self.assertIn("# attempt-10", used)
+        self.assertEqual(self.target()["terraform_source"],
+                         "s3://agentbkt/projects/prj_test/deploy/dep-test-ec2/attempt-10/")
+
+    def test_agentcore_bucket_cloud_subfolder_and_missing_attempts(self):
+        root = self.tmp / "s3" / "agentbkt" / "projects" / "prj_test" / "deploy"
+        shutil.copytree(self.module_dir("ec2", "\n# aws-sub\n"), root / "dep-test-ec2" / "attempt-1" / "aws")
+        env = self.aws_env(PAWPLOY_AGENT_BUCKET="agentbkt", FAKE_AWS_S3_ROOT=str(self.tmp / "s3"))
+        code, out = self.run_worker("deploy", self.write_job(), **env)
+        self.assertEqual(code, 0, out)
+        self.assertIn("# aws-sub", (self.tdir() / "modules" / "app" / "main.tf").read_text(encoding="utf-8"))
+        self.assertTrue(self.target()["terraform_source"].endswith("/attempt-1/aws/"))
+
+        # AgentCore 모듈이 아직 없는 배포 → 기본 모듈
+        code, out = self.run_worker("deploy", self.write_job("job2.json", deploy_id="dep-test-none"), **env)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.target(deploy_id="dep-test-none")["terraform_source"], "modules/ec2")
+
     def test_agentcore_module_policy_violation_is_reported(self):
         module = self.module_dir("ec2", "\n# FAKE_POLICY_VIOLATION\n")
         code, out = self.run_worker("deploy", self.write_job(terraform_uri=module))

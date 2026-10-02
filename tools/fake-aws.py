@@ -12,6 +12,7 @@
   dynamodb scan                            → FAKE_AWS_SCAN_ITEMS (JSON 배열) 를 Items 로
   sqs receive-message / delete-message     → FAKE_AWS_SQS(JSON 파일, 메시지 본문 배열)에서 꺼내고 지운다
   s3 sync / s3 cp                          → 빈 출력 (cp 대상이 "-" 면 FAKE_AWS_S3_BODY)
+                                             FAKE_AWS_S3_ROOT 가 있으면 s3://버킷/키 = <ROOT>/버킷/키 로 sync·list-objects-v2
   resourcegroupstaggingapi get-resources   → FAKE_AWS_TAGGED (JSON 배열) 를 ResourceTagMappingList 로
   ec2 get-console-output / logs tail       → 가짜 로그 텍스트
   sts get-caller-identity                  → 계정 123456789012
@@ -23,6 +24,7 @@
 import json
 import os
 import sys
+import shutil
 from pathlib import Path
 
 DIGEST = "sha256:" + "a" * 64
@@ -105,9 +107,18 @@ def main(argv: list[str]) -> int:
                          if bodies else {}))
     elif (service, op) == ("dynamodb", "scan"):
         print(json.dumps({"Items": json.loads(os.environ.get("FAKE_AWS_SCAN_ITEMS", "[]")), "Count": 0}))
+    elif (service, op) == ("s3api", "list-objects-v2") and os.environ.get("FAKE_AWS_S3_ROOT"):
+        prefix = arg("--prefix", "")
+        folder = Path(os.environ["FAKE_AWS_S3_ROOT"]) / arg("--bucket") / prefix
+        subdirs = sorted(d.name for d in folder.iterdir() if d.is_dir()) if folder.is_dir() else []
+        print(json.dumps({"CommonPrefixes": [{"Prefix": f"{prefix}{d}/"} for d in subdirs]} if subdirs else {}))
     elif service == "s3":
         if op == "cp" and len(argv) > 3 and argv[3] == "-":
             print(os.environ.get("FAKE_AWS_S3_BODY", "{}"))
+        elif op == "sync" and argv[2].startswith("s3://") and os.environ.get("FAKE_AWS_S3_ROOT"):
+            src = Path(os.environ["FAKE_AWS_S3_ROOT"]) / argv[2][len("s3://"):]
+            if src.is_dir():
+                shutil.copytree(src, argv[3], dirs_exist_ok=True)
     elif (service, op) == ("resourcegroupstaggingapi", "get-resources"):
         print(json.dumps({"ResourceTagMappingList": json.loads(os.environ.get("FAKE_AWS_TAGGED", "[]"))}))
     elif (service, op) == ("ec2", "get-console-output"):
