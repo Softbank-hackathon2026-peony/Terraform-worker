@@ -69,6 +69,12 @@ def find_violations(module_dir: Path, cloud: str, architecture: str) -> list[str
 def check_code(code: str, cloud: str, architecture: str) -> list[str]:
     v = [f"금지된 문법: {why}" for pattern, why in FORBIDDEN if re.search(pattern, code)]
 
+    # 앱 권한은 이 모듈에서 만든 리소스를 참조해야 한다. 문자열로 적으면 계정에 이미 있는 역할·계정을 가져다 쓸 수 있다
+    for attr, literal in re.findall(r'\b(iam_instance_profile|service_account|role)\s*=\s*"([^"]*)"', code):
+        if not (attr == "role" and literal == "roles/run.invoker"):
+            v.append(f'{attr} 에 문자열("{literal}")을 직접 쓸 수 없음 — 이 모듈에서 만든 리소스를 참조할 것 '
+                     f"(이미 있는 역할·계정 재사용 금지)")
+
     for src in re.findall(r'\bsource\s*=\s*"([^"]+)"', code):
         if src != PROVIDER_SOURCES[cloud]:
             v.append(f"허용하지 않는 provider source: {src} (가능: {PROVIDER_SOURCES[cloud]})")

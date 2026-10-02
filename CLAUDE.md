@@ -111,7 +111,10 @@ tfworker/
   expire.py          sweep(로컬+DynamoDB 에서 만료 배포 찾아 destroy), orphans(AWS 태그로 남은 리소스 알림)
   awscli.py          aws CLI 실행 도우미 (PAWPLOY_OFFLINE=1이면 AWS 호출 단계 건너뜀)
   (store.py)         + deploy_id 단위 잠금(같은 테이블 lock#<id>, 조건부 쓰기, 임대 3600초)·결과 조회(get)
-  (__main__.py)      + 입력 오류 기록(status=rejected / last_rejection), 다른 워커의 결과 이어받기, drain-destroy-queue
+  (__main__.py)      + 입력 오류 기록(status=rejected / last_rejection), 다른 워커의 결과 이어받기, drain-destroy-queue,
+                       작업 JSON 을 s3:// 경로로 받기, maintenance(만료 큐 + sweep 한 번에)
+  (policy·iac)       + 앱 권한 탈취 차단: EC2 프로필·Lambda 역할·Cloud Run 서비스 계정은 이 배포에서 만든 것만
+                       (AWS 는 plan 에서 값이 정해져 있으면 기존 것, GCP 는 만든 계정 이메일과 비교·미지정 거부), 만료 예약은 루트에서만
 Dockerfile         워커 실행 이미지 (python 3.12 + terraform 1.16.0 체크섬 검증 + aws CLI, 사용자 worker, /work)
 infra/setup-aws.sh S3 버킷·DynamoDB·SQS·Scheduler 역할 생성 (기본 출력만, --apply 로 생성). 아직 실행 안 함
 modules/
@@ -127,7 +130,7 @@ tools/
   fake-aws.py           가짜 aws CLI (FAKE_AWS_LOG 에 호출 기록, ECR·DynamoDB·S3·태그 조회 응답 흉내)
   push-sample-image.sh  샘플 이미지 linux/amd64 빌드 → ECR 푸시 (--provenance=false 필수, Lambda 가 이미지 인덱스를 거부)
 tests/
-  test_worker.py     unittest 32개. `python -m unittest -v` (비용 없음, 30~40초)
+  test_worker.py     unittest 36개. `python -m unittest -v` (비용 없음, 40초 안팎)
 ```
 
 - S3 backend 는 `use_lockfile=true`로 잠금 → Terraform **1.10 이상**. key 는 `deployments/<project_id>/<deploy_id>/<cloud>.tfstate` (GCP state 도 S3)

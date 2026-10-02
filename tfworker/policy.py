@@ -12,6 +12,9 @@
   - 보안 그룹 인바운드는 80 번 포트만
   - IAM: 허용한 관리형 정책만, 인라인 정책 금지 (GCP: 서비스 단위 공개 호출 권한만, 프로젝트 IAM 금지)
   - Cloud Run: 메모리 상한, 인스턴스 최대 1개, deletion_protection 꺼짐 (켜져 있으면 destroy 실패)
+  - 앱 권한: EC2 인스턴스 프로필·Lambda 역할·Cloud Run 서비스 계정은 이 배포에서 새로 만든 것만
+    (계정에 이미 있는 관리자 역할이나 GCP 기본 계정을 가져다 쓰는 것 차단)
+  - 만료 예약(aws_scheduler_schedule)은 워커 루트에서만
   - 태그(AWS)·label(GCP)이 있는 리소스에는 pawploy 필수 태그 4개가 모두 있어야 함
 
 AgentCore 가 만든 Terraform 도 같은 검사를 거친다. 실행 전 정적 검사는 iac.py.
@@ -78,14 +81,15 @@ def check(plan: dict, architecture: str) -> None:
 def find_violations(plan: dict, architecture: str) -> list[str]:
     allowed = ALLOWED_TYPES.get(architecture, set()) | COMMON_TYPES
     violations: list[str] = []
+    changes = [rc for rc in plan.get("resource_changes") or []
+               if rc.get("mode") != "data"   # data 소스는 읽기 전용
+               and not set(rc.get("change", {}).get("actions") or []) <= {"no-op", "read"}]
+    # 이 배포에서 새로 만드는 GCP 서비스 계정 (Cloud Run 은 이 계정으로만 실행해야 한다)
+    created_sa = {(rc["change"].get("after") or {}).get("account_id")
+                  for rc in changes if rc.get("type") == "google_service_account"} - {None}
 
-    for rc in plan.get("resource_changes") or []:
-        if rc.get("mode") == "data":
-            continue  # data 소스는 읽기 전용
+    for rc in changes:
         actions = set(rc.get("change", {}).get("actions") or [])
-        if not actions or actions <= {"no-op", "read"}:
-            continue
-
         address = rc.get("address", "?")
         rtype = rc.get("type", "?")
 
@@ -94,11 +98,44 @@ def find_violations(plan: dict, architecture: str) -> list[str]:
         if rtype not in allowed:
             violations.append(f"{address}: 허용하지 않는 리소스 종류 {rtype}")
             continue  # 종류가 틀리면 아래 세부 검사는 의미 없음
+        if rtype in COMMON_TYPES and address.startswith("module."):
+            # 만료 예약은 워커 루트에서만 만든다. 모듈(AI 코드)이 만들면 임의 역할로 임의 API 를 부를 수 있다
+            violations.append(f"{address}: {rtype} 는 워커가 루트에서만 만든다 (모듈 안에서 허용하지 않음)")
+            continue
 
         after = rc.get("change", {}).get("after") or {}
+        unknown = rc.get("change", {}).get("after_unknown") or {}
         violations += _check_resource(address, rtype, after)
+        violations += _check_identity(address, rtype, after, unknown, created_sa)
 
     return violations
+
+
+def _check_identity(address: str, rtype: str, after: dict, unknown: dict, created_sa: set) -> list[str]:
+    """앱이 쓰는 권한(역할·인스턴스 프로필·서비스 계정)은 이 배포에서 새로 만든 것이어야 한다.
+
+    AI 가 만든 코드가 계정에 이미 있는 관리자 역할이나 GCP 기본 계정(편집자)의 이름을 적으면,
+    워커의 넓은 권한으로 그대로 붙어 사용자 앱이 우리 계정을 조작할 수 있게 된다.
+    AWS 는 새로 만드는 역할·프로필의 이름이 plan 시점에 "알 수 없음"으로 나오므로, 값이 정해진 문자열이면 기존 것이다.
+    """
+    v: list[str] = []
+    for rtype_, attr in (("aws_instance", "iam_instance_profile"), ("aws_iam_instance_profile", "role"),
+                         ("aws_lambda_function", "role")):
+        if rtype == rtype_ and after.get(attr) and not unknown.get(attr):
+            v.append(f"{address}: {attr} 에 이미 있는 역할·프로필({after[attr]})을 쓸 수 없음 (이 배포에서 만든 것만)")
+
+    if rtype == "google_cloud_run_v2_service":
+        for i, template in enumerate(after.get("template") or []):
+            sa = template.get("service_account")
+            sa_unknown = ((unknown.get("template") or [{}])[i] if i < len(unknown.get("template") or []) else {}) \
+                .get("service_account")
+            if sa_unknown:
+                continue   # 이 배포에서 만드는 계정이라 아직 값이 없다
+            if not sa:
+                v.append(f"{address}: service_account 를 지정해야 함 (없으면 편집자 권한의 Compute 기본 계정으로 실행)")
+            elif not (sa.endswith(".iam.gserviceaccount.com") and sa.split("@")[0] in created_sa):
+                v.append(f"{address}: service_account {sa} 는 이 배포에서 만든 계정이 아님")
+    return v
 
 
 def _check_resource(address: str, rtype: str, after: dict) -> list[str]:

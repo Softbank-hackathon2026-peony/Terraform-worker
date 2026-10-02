@@ -1,11 +1,12 @@
 """Terraform Worker 진입점 (파이프라인 21~27단계).
 
-  python -m tfworker deploy <작업.json>              # 21 → 26 → 27 (실패 시 22)
+  python -m tfworker deploy <작업.json | s3://…>     # 21 → 26 → 27 (실패 시 22). 작업 JSON 은 로컬 파일 또는 S3
   python -m tfworker destroy <deploy_id> [aws|gcp]   # 삭제 (클라우드 하나만 지울 수도 있음)
   python -m tfworker status <deploy_id>              # 결과 보기 (Main Server 에 돌려줄 내용)
   python -m tfworker sweep [--dry-run]               # 만료된 배포 찾아 삭제 (5~10분마다 정기 실행용)
   python -m tfworker orphans [region]                # 태그로 만료 지난 AWS 리소스 찾기 (알림만, 있으면 exit 1)
   python -m tfworker drain-destroy-queue [queue_url]  # 만료 예약(SQS) 메시지를 모두 받아 destroy (정기 실행용)
+  python -m tfworker maintenance                     # 정기 실행 한 번에: 만료 큐 처리 + sweep (5~10분마다)
 
 Terraform 은 AgentCore 가 만들어 S3 에 둔다(18~19단계). 워커는 사용자가 승인한 클라우드(target)마다
 AI 없이 항상 같은 순서로 검증하고 실행한다.
@@ -92,6 +93,18 @@ def write_target(job: dict, cloud: str, reset: bool = False, **fields) -> dict:
     return result
 
 
+def _read_job(job_path: str) -> str:
+    """작업 JSON 을 로컬 파일 또는 S3(s3://버킷/키)에서 읽는다. 클라우드에서는 Main Server 가 S3 에 올리고 경로만 넘긴다.
+
+    Windows 도구(PowerShell 5.1, 메모장)가 붙이는 BOM 이 있어도 읽는다.
+    """
+    if job_path.startswith("s3://"):
+        text = awscli.run("s3", "cp", job_path, "-", json_output=False)
+    else:
+        text = Path(job_path).read_text(encoding="utf-8-sig")
+    return text.lstrip("\ufeff")
+
+
 def _sync_from_store(deploy_id: str) -> dict:
     """다른 워커가 DynamoDB 에 남긴 결과가 더 새로우면 로컬 result.json 으로 가져온다 (컨테이너가 바뀌어도 이어서 진행)."""
     item = store.get(deploy_id)
@@ -155,8 +168,7 @@ def _clear_rejection(deploy_id: str) -> None:
 def deploy(job_path: str) -> int:
     raw = None
     try:
-        # utf-8-sig: Windows 도구(PowerShell 5.1, 메모장)가 붙이는 BOM 이 있어도 읽는다
-        raw = json.loads(Path(job_path).read_text(encoding="utf-8-sig"))
+        raw = json.loads(_read_job(job_path))
         if raw.get("recommendation_uri"):
             raw = recommendation.merge(raw, recommendation.load(raw["recommendation_uri"]))
         job = jobmod.validate(raw)
@@ -431,6 +443,28 @@ def drain_destroy_queue(queue_url: str | None) -> int:
     return 1 if failed else 0
 
 
+def maintenance() -> int:
+    """정기 실행용 묶음 (EventBridge Scheduler → 워커 작업, 5~10분마다): 만료 예약 큐 처리 → sweep.
+
+    하나가 실패해도 나머지는 실행한다. 큐 주소(PAWPLOY_DESTROY_QUEUE_URL)가 없으면 sweep 만 한다.
+    """
+    failed = False
+    if os.environ.get("PAWPLOY_DESTROY_QUEUE_URL"):
+        try:
+            failed |= drain_destroy_queue(None) != 0
+        except awscli.AwsError as e:
+            print(f"[maintenance] 만료 큐 처리 실패 (sweep 은 계속): {e}")
+            failed = True
+    else:
+        print("[maintenance] PAWPLOY_DESTROY_QUEUE_URL 없음 → 만료 큐 처리 건너뜀")
+    try:
+        failed |= sweep(False) != 0
+    except awscli.AwsError as e:
+        print(f"[maintenance] sweep 실패: {e}")
+        failed = True
+    return 1 if failed else 0
+
+
 def orphans(region: str) -> int:
     """pawploy 태그가 붙었는데 만료 시각이 지난 리소스를 찾아 보여 준다. 지우지는 않는다. (AWS 만)"""
     try:
@@ -451,6 +485,8 @@ def main(argv: list[str]) -> int:
     cmd, args = (argv[0] if argv else None), argv[1:]
     if cmd == "sweep" and not set(args) - {"--dry-run"}:
         return sweep("--dry-run" in args)
+    if cmd == "maintenance" and not args:
+        return maintenance()
     if cmd == "drain-destroy-queue" and len(args) <= 1:
         return drain_destroy_queue(args[0] if args else None)
     if cmd == "orphans" and len(args) <= 1:

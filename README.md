@@ -56,12 +56,13 @@ preparing ─ generating ──────────────────�
 ## 사용법
 
 ```bash
-python -m tfworker deploy <작업.json>              # 21 → 27
+python -m tfworker deploy <작업.json | s3://…>     # 21 → 27 (클라우드에서는 Main 이 S3 에 올린 작업 JSON 경로)
 python -m tfworker status <deploy_id>              # 결과 (work/<deploy_id>/result.json)
 python -m tfworker destroy <deploy_id> [aws|gcp]   # 삭제 (클라우드 하나만도 가능)
 python -m tfworker sweep [--dry-run]               # 만료된 배포를 모두 삭제 (5~10분마다 정기 실행)
 python -m tfworker orphans [region]                # 태그로 만료 지난 AWS 리소스 찾기 (삭제 안 함, 있으면 exit 1)
-python -m tfworker drain-destroy-queue [queue_url]  # 만료 예약(SQS) 메시지를 모두 받아 destroy (sweep 과 함께 정기 실행)
+python -m tfworker drain-destroy-queue [queue_url]  # 만료 예약(SQS) 메시지를 모두 받아 destroy
+python -m tfworker maintenance                     # 정기 실행 한 번에: 만료 큐 처리 + sweep (5~10분마다)
 ```
 
 ### 컨테이너 이미지 (클라우드에서 실행)
@@ -167,9 +168,10 @@ terraform -chdir=work/<deploy_id>/<cloud> init -backend=false && terraform -chdi
 | `aws_ssm_parameter` 중 `/aws/service/...` 가 아닌 것, `access_token` | 팀 비밀값·워커 GCP 토큰을 앱 환경변수로 흘릴 수 있음 |
 | `file()`·`templatefile()` 의 경로가 `"${path.module}/..."` 가 아닌 것 | 워커 컴퓨터의 자격 증명 파일을 읽어 앱으로 넘길 수 있음 |
 | 허용 목록 밖 리소스 (`policy.ALLOWED_TYPES`), 허용 밖 IAM 정책·인라인 정책 | 우리 계정 권한 탈취·비용 |
+| `iam_instance_profile`·`role`·`service_account` 에 문자열 직접 쓰기 (예외: `roles/run.invoker`) | 계정에 이미 있는 관리자 역할·GCP 기본 계정(편집자)을 앱에 붙일 수 있음 |
 | EC2 `cpu_credits` 가 `standard` 가 아님, Cloud Run `deletion_protection` 이 `false` 가 아님 | 추가 과금 / 1시간 뒤 destroy 실패 |
 
-plan 결과는 apply 전에 `policy.py` 가 한 번 더 검사합니다(인스턴스 타입, Lambda 메모리·타임아웃, 인바운드 80번만, Cloud Run 메모리 2Gi·인스턴스 1개 이하, 공개 호출 권한은 `roles/run.invoker → allUsers` 만, 필수 태그/label).
+plan 결과는 apply 전에 `policy.py` 가 한 번 더 검사합니다(앱 권한은 이 배포에서 새로 만든 역할·프로필·서비스 계정만, Cloud Run 은 서비스 계정 지정 필수, 만료 예약은 워커 루트에서만, 인스턴스 타입, Lambda 메모리·타임아웃, 인바운드 80번만, Cloud Run 메모리 2Gi·인스턴스 1개 이하, 공개 호출 권한은 `roles/run.invoker → allUsers` 만, 필수 태그/label).
 
 ## 결과 형식 (22·27단계: Worker → Main Server)
 
@@ -307,7 +309,7 @@ work/<deploy_id>/  배포마다 생기는 작업 폴더 (git 제외): result.jso
 
 | 항목 | 상태 |
 |---|---|
-| 가짜 terraform·aws 로 32개 경로 (+ 입력 오류 기록, DynamoDB 잠금·결과 이어받기, 만료 큐 처리): 단일·멀티 클라우드, 한쪽 실패 후 그쪽만 재시도, 단계별 실패 보고·정리, AgentCore 모듈 사용·IaC 거부·정책 거부, 입력 오류, sweep·orphans 등 | ✅ |
+| 가짜 terraform·aws 로 36개 경로 (+ 기존 역할·계정 재사용 차단, S3 작업 입력, maintenance) (+ 입력 오류 기록, DynamoDB 잠금·결과 이어받기, 만료 큐 처리): 단일·멀티 클라우드, 한쪽 실패 후 그쪽만 재시도, 단계별 실패 보고·정리, AgentCore 모듈 사용·IaC 거부·정책 거부, 입력 오류, sweep·orphans 등 | ✅ |
 | 실제 terraform `validate` (EC2·Lambda·Cloud Run 루트+모듈) + `fmt` | ✅ (AWS provider 6.67, Google provider 6.50) |
 | 실제 AWS EC2 한 바퀴 (배포 → 접속 → 삭제) | ✅ 2026-10-02 (`targets` 구조로 재확인: 헬스체크 121초, 삭제 후 남은 리소스 없음) |
 | 실제 GCP Cloud Run 한 바퀴 (배포 → 접속 → 삭제) | ✅ 2026-10-02 (`softbankhackathon2026-peony`, 첫 시도 403 → 실패 보고·정리 → 권한 추가 후 같은 deploy_id 재시도 성공) |

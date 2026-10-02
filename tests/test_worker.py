@@ -466,8 +466,10 @@ locals {
         labels = {"terraform_labels": {k: "v" for k in policy.REQUIRED_LABELS}}
         good_run = {"deletion_protection": False, **labels,
                     "template": [{"scaling": [{"max_instance_count": 1}],
+                                  "service_account": "pp-x@proj-1234.iam.gserviceaccount.com",
                                   "containers": [{"resources": [{"limits": {"memory": "1Gi"}}]}]}]}
-        self.assertEqual(policy.find_violations(plan(change("google_cloud_run_v2_service", good_run)), "cloud_run"), [])
+        self.assertEqual(policy.find_violations(plan(change("google_service_account", {"account_id": "pp-x"}),
+                                                     change("google_cloud_run_v2_service", good_run)), "cloud_run"), [])
         v = "\n".join(policy.find_violations(plan(
             change("google_cloud_run_v2_service", {
                 "deletion_protection": True, "terraform_labels": {},
@@ -682,6 +684,90 @@ locals {
         deletes = self.aws_calls("sqs", "delete-message")
         self.assertEqual(len(deletes), 2, "처리한 메시지와 잘못된 메시지 모두 지움")
         self.assertIn("ap-northeast-2", deletes[0], "리전은 큐 주소에서")
+
+    # ---------- 권한 탈취 차단 · S3 입력 · 정기 실행 ----------
+
+    def test_policy_blocks_reusing_existing_roles_and_accounts(self):
+        sys.path.insert(0, str(ROOT))
+        from tfworker import policy
+        tags = {"tags_all": {t: "v" for t in policy.REQUIRED_TAGS}}
+
+        def change(address, rtype, after, unknown=None):
+            return {"address": address, "mode": "managed", "type": rtype,
+                    "change": {"actions": ["create"], "after": after, "after_unknown": unknown or {}}}
+
+        # 이 배포에서 만드는 역할·프로필은 plan 시점에 "알 수 없음" → 통과
+        ok = [change("module.app.aws_instance.app", "aws_instance",
+                     {"instance_type": "t3.small", **tags}, {"iam_instance_profile": True}),
+              change("module.app.aws_iam_instance_profile.app", "aws_iam_instance_profile", tags, {"role": True})]
+        self.assertEqual(policy.find_violations({"resource_changes": ok}, "ec2"), [])
+
+        # 계정에 이미 있는 관리자 프로필·역할을 이름으로 적으면 → 거부
+        bad = [change("module.app.aws_instance.app", "aws_instance",
+                      {"instance_type": "t3.small", "iam_instance_profile": "AdminProfile", **tags}),
+               change("module.app.aws_iam_instance_profile.app", "aws_iam_instance_profile",
+                      {"role": "OrganizationAdmin", **tags}),
+               change("aws_scheduler_schedule.expire", "aws_scheduler_schedule", tags),            # 루트: 허용
+               change("module.app.aws_scheduler_schedule.x", "aws_scheduler_schedule", tags)]      # 모듈: 거부
+        v = "\n".join(policy.find_violations({"resource_changes": bad}, "ec2"))
+        for expected in ("AdminProfile", "OrganizationAdmin", "module.app.aws_scheduler_schedule.x"):
+            self.assertIn(expected, v)
+        self.assertNotIn("aws_scheduler_schedule.expire:", v, "워커 루트의 만료 예약은 허용")
+        v = "\n".join(policy.find_violations({"resource_changes": [change(
+            "module.app.aws_lambda_function.app", "aws_lambda_function",
+            {"role": "arn:aws:iam::123456789012:role/admin", "memory_size": 512, "timeout": 30, **tags})]}, "lambda"))
+        self.assertIn("role/admin", v)
+
+        # Cloud Run: 이 배포에서 만든 계정만. 지정 안 하면(기본 Compute 계정 = 편집자) 거부
+        labels = {"terraform_labels": {k: "v" for k in policy.REQUIRED_LABELS}}
+
+        def run(sa):
+            template = {"scaling": [{"max_instance_count": 1}], "containers": [{"resources": [{"limits": {"memory": "1Gi"}}]}]}
+            if sa:
+                template["service_account"] = sa
+            return {"resource_changes": [
+                change("module.app.google_service_account.app", "google_service_account", {"account_id": "pp-dep-x"}),
+                change("module.app.google_cloud_run_v2_service.app", "google_cloud_run_v2_service",
+                       {"deletion_protection": False, "template": [template], **labels})]}
+
+        self.assertEqual(policy.find_violations(run("pp-dep-x@proj-1234.iam.gserviceaccount.com"), "cloud_run"), [])
+        self.assertIn("기본 계정", "\n".join(policy.find_violations(run(None), "cloud_run")))
+        self.assertIn("이 배포에서 만든 계정이 아님", "\n".join(policy.find_violations(
+            run("123456-compute@developer.gserviceaccount.com"), "cloud_run")))
+
+    def test_iac_blocks_literal_roles_and_accounts(self):
+        sys.path.insert(0, str(ROOT))
+        from tfworker import iac
+        run = (ROOT / "modules" / "cloud_run" / "main.tf").read_text(encoding="utf-8")
+        bad = run.replace("service_account = google_service_account.app.email",
+                          'service_account = "123456-compute@developer.gserviceaccount.com"')
+        self.assertIn("service_account 에 문자열", "\n".join(iac.check_code(bad, "gcp", "cloud_run")))
+        ec2 = (ROOT / "modules" / "ec2" / "main.tf").read_text(encoding="utf-8")
+        bad = ec2.replace("iam_instance_profile        = aws_iam_instance_profile.app.name",
+                          'iam_instance_profile        = "AdminProfile"')
+        self.assertIn("iam_instance_profile 에 문자열", "\n".join(iac.check_code(bad, "aws", "ec2")))
+
+    def test_job_can_be_read_from_s3(self):
+        job = json.loads(Path(self.write_job()).read_text(encoding="utf-8"))
+        env = self.aws_env(FAKE_AWS_S3_BODY=json.dumps(job))
+        code, out = self.run_worker("deploy", "s3://pawploy-jobs/prj_test/dep-test-ec2.json", **env)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.result()["status"], "running")
+        cp = self.aws_calls("s3", "cp")
+        self.assertEqual(cp[0][2:4], ["s3://pawploy-jobs/prj_test/dep-test-ec2.json", "-"])
+
+    def test_maintenance_runs_queue_and_sweep(self):
+        env = self.aws_env(PAWPLOY_DESTROY_QUEUE_URL="https://sqs.ap-northeast-2.amazonaws.com/123456789012/q")
+        self.assertEqual(self.run_worker("deploy", self.write_job(deploy_id="dep-by-queue"), **env)[0], 0)
+        self.assertEqual(self.run_worker("deploy", self.write_job(name="b.json", deploy_id="dep-by-sweep"), **env)[0], 0)
+        self.aws_sqs.write_text(json.dumps([json.dumps({"action": "destroy", "deploy_id": "dep-by-queue"})]),
+                                encoding="utf-8")
+        self._set_result("dep-by-sweep", expires_at="2000-01-01T00:00:00Z")
+
+        code, out = self.run_worker("maintenance", **env)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.result("dep-by-queue")["status"], "destroyed", "만료 큐로 삭제")
+        self.assertEqual(self.result("dep-by-sweep")["status"], "destroyed", "sweep 으로 삭제")
 
     def test_dynamodb_attr_roundtrip(self):
         sys.path.insert(0, str(ROOT))

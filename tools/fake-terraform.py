@@ -49,10 +49,12 @@ def _fake_plan(workdir: Path) -> dict:
         labels = {"terraform_labels": {k: "v" for k in (
             "pawploy-managed", "pawploy-project-id", "pawploy-deploy-id", "pawploy-expires-at")}}
         changes = [
-            _change("module.app.google_service_account.app", "google_service_account", {}, tagged=False),
+            _change("module.app.google_service_account.app", "google_service_account",
+                    {"account_id": "pp-fake"}, tagged=False),
             _change("module.app.google_cloud_run_v2_service.app", "google_cloud_run_v2_service", {
                 "deletion_protection": False, **labels,
                 "template": [{"scaling": [{"max_instance_count": 1}],
+                              "service_account": "pp-fake@fake-project.iam.gserviceaccount.com",
                               "containers": [{"resources": [{"limits": {"cpu": "1", "memory": "1Gi"}}]}]}],
             }, tagged=False),
             _change("module.app.google_cloud_run_v2_service_iam_member.public", "google_cloud_run_v2_service_iam_member",
