@@ -1,0 +1,5 @@
+# 리눅스에서 실행되는 파일은 Windows 에서 받아도 줄바꿈을 LF 로 둔다.
+# CRLF 로 바뀌면 줄 끝의 CR 문자 때문에 셸 스크립트·EC2 부팅 스크립트(user_data)가 실패한다.
+*.sh       text eol=lf
+*.tftpl    text eol=lf
+Dockerfile text eol=lf
