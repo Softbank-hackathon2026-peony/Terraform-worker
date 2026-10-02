@@ -1,20 +1,21 @@
-"""Terraform Worker 진입점.
+"""Terraform Worker 진입점 (파이프라인 21~27단계).
 
-  python -m tfworker deploy examples/job-ec2.json     # 배포
-  python -m tfworker destroy <deploy_id>               # 삭제
-  python -m tfworker status <deploy_id>                # 결과 보기
-  python -m tfworker sweep [--dry-run]                 # 만료된 배포 찾아 삭제 (5~10분마다 정기 실행용)
-  python -m tfworker orphans [region]                  # 태그로 만료 지난 리소스 찾기 (알림만, 있으면 exit 1)
+  python -m tfworker deploy <작업.json>              # 21 → 26 → 27 (실패 시 22)
+  python -m tfworker destroy <deploy_id> [aws|gcp]   # 삭제 (클라우드 하나만 지울 수도 있음)
+  python -m tfworker status <deploy_id>              # 결과 보기 (Main Server 에 돌려줄 내용)
+  python -m tfworker sweep [--dry-run]               # 만료된 배포 찾아 삭제 (5~10분마다 정기 실행용)
+  python -m tfworker orphans [region]                # 태그로 만료 지난 AWS 리소스 찾기 (알림만, 있으면 exit 1)
 
-배포 단계 (AI 없이 항상 같은 결과를 내는 코드)
-  2. 추천 결과 읽기   recommendation.py  (작업 입력에 recommendation_uri가 있을 때)
-     입력 검증        job.py
-  1. ECR 이미지 확인  image.py           (태그 → digest 고정)
-  3. Terraform 생성   render.py          (모듈 복사 + 변수 파일)
-  4. S3 보관          artifacts.py       (init 뒤에 해서 provider 잠금 파일까지 저장)
-  5. 적용            terraform.py       (plan → 정책 검사 policy.py → apply → output)
-  실패·응답 없음이면 diagnose.py가 진단 자료를 모으고 AgentCore 진단 에이전트를 부른다.
-  상태는 result.json 과 DynamoDB(store.py)에 기록하고, 만료 정리는 expire.py 가 맡는다.
+Terraform 은 AgentCore 가 만들어 S3 에 둔다(18~19단계). 워커는 사용자가 승인한 클라우드(target)마다
+AI 없이 항상 같은 순서로 검증하고 실행한다.
+  preparing    ECR 이미지 확인·digest 고정 (AWS)                           image.py
+  generating   모듈 가져오기 + 루트 main.tf(provider·태그·backend)          render.py
+               IaC 정적 검사                                               iac.py
+  init → plan → 정책 검사(policy.py) → S3 보관(artifacts.py) → apply → health_check(26) → running(27)
+
+실패하면 어느 단계든: 앱 로그 수집 → 만든 리소스 정리 → failed 로 보고 (22: failed_stage·log_tail·current_state).
+Main Server 가 AgentCore 에 수정을 맡긴 뒤(23~25) 같은 deploy_id 로 다시 요청하면 빈 상태에서 다시 배포한다.
+AWS·GCP 를 함께 배포하다 한쪽이 실패해도 성공한 쪽은 그대로 둔다 (전체 상태 partial).
 """
 import json
 import os
@@ -22,153 +23,232 @@ import sys
 import time
 from pathlib import Path
 
-from . import artifacts, awscli, diagnose, expire, health, image, policy, recommendation, store
+from . import artifacts, awscli, diagnose, expire, health, iac, image, policy, recommendation, store
 from . import job as jobmod, render, terraform as tf
 
-HEALTH_TIMEOUT = {"ec2": 420, "lambda": 180}   # EC2는 부팅 + Docker 설치 시간이 필요
+HEALTH_TIMEOUT = {"ec2": 420, "lambda": 180, "cloud_run": 180}   # EC2는 부팅 + Docker 설치 시간이 필요
+IN_PROGRESS = {"preparing", "generating", "init", "plan", "apply", "health_check"}
+# 리소스가 남아 있지 않은 클라우드 상태: 같은 deploy_id 로 그 클라우드를 다시 배포할 수 있다
+REUSABLE_TARGET_STATUSES = {None, "failed", "destroyed"}
+TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
-def _health_params(architecture: str) -> tuple[int, int]:
-    """헬스체크 (최대 대기 초, 재시도 간격 초). 테스트에서는 환경변수로 짧게 줄인다."""
-    timeout = int(os.environ.get("PAWPLOY_HEALTH_TIMEOUT") or HEALTH_TIMEOUT[architecture])
-    interval = int(os.environ.get("PAWPLOY_HEALTH_INTERVAL") or 10)
-    return timeout, interval
+class HealthCheckFailed(RuntimeError):
+    pass
 
 
-def write_result(job: dict, **fields) -> dict:
-    path = render.workdir_for(job["deploy_id"]) / "result.json"
-    result = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    result.update({"deploy_id": job["deploy_id"], "architecture": job["architecture"],
-                   "expires_at": job["expires_at"], **fields,
-                   "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+# ---------------- 결과 기록 (result.json + DynamoDB) ----------------
+
+def load_result(deploy_id: str) -> dict:
+    path = render.workdir_for(deploy_id) / "result.json"
+    try:
+        result = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return result if isinstance(result.get("targets"), dict) else {}   # 이전 형식(클라우드 구분 없음)은 무시
+
+
+def aggregate(targets: dict) -> str:
+    """클라우드별 상태 → 전체 상태. sweep·store 는 이 값을 본다."""
+    s = {t.get("status") for t in targets.values()}
+    if s & IN_PROGRESS:
+        return "deploying"
+    if "destroying" in s:
+        return "destroying"
+    if "destroy_failed" in s:
+        return "destroy_failed"
+    if s == {"running"}:
+        return "running"
+    if "running" in s:
+        return "partial"
+    if s <= {"destroyed", "failed"}:
+        return "destroyed" if "destroyed" in s else "failed"
+    return "unknown"
+
+
+def write_target(job: dict, cloud: str, reset: bool = False, **fields) -> dict:
+    """클라우드 하나의 상태를 갱신하고 전체 결과를 다시 쓴다. reset 이면 그 클라우드의 이전 기록을 버린다."""
+    deploy_id = job["deploy_id"]
+    now = time.strftime(TIME_FORMAT, time.gmtime())
+    result = load_result(deploy_id)
+    targets = result.get("targets", {})
+    entry = {} if reset else targets.get(cloud, {})
+    entry.update(fields, updated_at=now)
+    targets[cloud] = entry
+    result.update(deploy_id=deploy_id, project_id=job["project_id"], expires_at=job["expires_at"],
+                  targets=targets, status=aggregate(targets), updated_at=now)
+    path = render.workdir_for(deploy_id) / "result.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"[worker] status={result.get('status')}", flush=True)
+    if "status" in fields:
+        print(f"[worker] {cloud}: status={fields['status']} (전체 {result['status']})", flush=True)
     store.put(result, job)   # PAWPLOY_STATUS_TABLE 이 있으면 DynamoDB 에도 (Main Server 가 읽음)
     return result
 
 
+# ---------------- deploy (21 → 26 → 27, 실패 시 22) ----------------
+
 def deploy(job_path: str) -> int:
-    # 2단계: 작업 입력 + AgentCore 추천 결과 → 검증
     try:
-        raw = json.loads(Path(job_path).read_text(encoding="utf-8"))
+        # utf-8-sig: Windows 도구(PowerShell 5.1, 메모장)가 붙이는 BOM 이 있어도 읽는다
+        raw = json.loads(Path(job_path).read_text(encoding="utf-8-sig"))
         if raw.get("recommendation_uri"):
             raw = recommendation.merge(raw, recommendation.load(raw["recommendation_uri"]))
         job = jobmod.validate(raw)
-        render.check_not_active(job["deploy_id"])   # 살아 있는 배포 위에 덮어쓰지 않는다
+        previous = load_result(job["deploy_id"])
+        for t in job["targets"]:   # 살아 있는 배포 위에 덮어쓰지 않는다
+            st = previous.get("targets", {}).get(t["cloud"], {}).get("status")
+            if st not in REUSABLE_TARGET_STATUSES:
+                raise jobmod.JobError(f"이미 사용 중인 deploy_id 입니다: {job['deploy_id']} ({t['cloud']} status={st}). "
+                                      f"먼저 destroy 하거나 실패한 클라우드만 다시 요청하세요")
     except (ValueError, OSError, awscli.AwsError) as e:
         print(f"[worker] 입력 오류: {e}")
         return 2
 
-    render.workdir_for(job["deploy_id"]).mkdir(parents=True, exist_ok=True)
-    write_result(job, status="preparing")
+    # 다른 클라우드가 아직 살아 있으면 만료 시각을 그대로 둔다 (재시도로 1시간 제한이 늘어나지 않게)
+    if any(t.get("status") not in REUSABLE_TARGET_STATUSES for t in previous.get("targets", {}).values()):
+        job["expires_at"] = previous["expires_at"]
+
+    for t in job["targets"]:
+        write_target(job, t["cloud"], reset=True, architecture=t["architecture"], status="preparing")
+    statuses = [deploy_target(job, render.target_job(job, t)) for t in job["targets"]]
+
+    result = load_result(job["deploy_id"])
+    print(f"\n[worker] 전체 상태: {result['status']}")
+    for cloud, t in result["targets"].items():
+        print(f"[worker]   {cloud}: {t['status']}  {t.get('endpoint', '') if t['status'] == 'running' else t.get('error', '')}")
+    print(f"[worker] 만료 시각(UTC): {result['expires_at']}  →  그 전에 'python -m tfworker destroy {job['deploy_id']}'")
+    return 0 if all(s == "running" for s in statuses) else 1
+
+
+def deploy_target(job: dict, tjob: dict) -> str:
+    """클라우드 하나를 배포한다. 돌려주는 값은 최종 상태 (running / failed / destroy_failed)."""
+    cloud = tjob["cloud"]
+    stage, wd, applied, resource_id = "preparing", None, False, None
     started = time.time()
 
-    # 1단계: ECR 이미지 확인
-    if awscli.offline():
-        print("[image] PAWPLOY_OFFLINE=1 → 이미지 확인 건너뜀", flush=True)
-    else:
-        try:
-            job["image_uri"] = image.resolve(job["image_uri"])
-        except awscli.AwsError as e:
-            write_result(job, status="failed", error=str(e))
-            return 2
+    def step(name, **fields):
+        nonlocal stage
+        stage = name
+        write_target(job, cloud, status=name, **fields)
 
-    # 3단계: Terraform 코드 생성
-    write_result(job, status="generating")
-    wd = render.render(job)
-
-    applied = False   # apply 를 시작했는지. 그 전에 실패하면 지울 리소스가 없다
     try:
-        write_result(job, status="init")
-        tf.run(wd, "init", "-upgrade", *render.backend_args(job))
+        if cloud == "aws" and not awscli.offline():
+            tjob["image_uri"] = image.resolve(tjob["image_uri"])
+        step("generating")
+        wd = render.render(tjob)
+        iac.check(wd / "modules" / "app", cloud, tjob["architecture"])
 
-        # 4단계: 생성된 코드 S3 보관 (apply 전에 해야 실패해도 같은 코드로 지울 수 있음)
-        artifacts.upload(job, wd)
+        step("init")
+        tf.run(wd, "init", "-upgrade", *render.backend_args(tjob))
 
-        # 5단계: 적용. plan 결과를 정책(허용 리소스·크기·태그)으로 검사한 뒤에만 apply 한다
-        write_result(job, status="plan")
+        step("plan")   # plan 결과를 정책(허용 리소스·크기·태그·IAM)으로 검사한 뒤에만 apply 한다
         tf.run(wd, "plan", "-out=tfplan")
         plan = tf.run(wd, "show", "-json", "tfplan", capture_json=True)
         (wd / "plan.json").write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
-        policy.check(plan, job["architecture"])
+        policy.check(plan, tjob["architecture"])
+        # 검사를 통과한 최종 코드를 apply 전에 보관 (실패해도 같은 코드로 지울 수 있게)
+        artifacts.upload(tjob, wd)
 
-        write_result(job, status="apply")
+        step("apply")
         applied = True
         tf.run(wd, "apply", "-auto-approve", "tfplan")
         out = tf.run(wd, "output", "-json", capture_json=True)
-    except (tf.TerraformError, awscli.AwsError, policy.PolicyError) as e:
-        result = write_result(job, status="failed", error=str(e),
-                              log_tail=getattr(e, "output", "")[-4000:])
-        _diagnose(job, wd, result)
-        if not applied:
-            # init/plan 단계 실패: 아직 아무것도 만들지 않았다. 여기서 destroy 를 돌리면
-            # init 실패 시 destroy 도 실패해 destroy_failed 가 되고 그 deploy_id 를 다시 못 쓴다
-            print("[worker] apply 전 실패 → 만들어진 리소스 없음, 정리 생략")
-            return 1
-        print("[worker] 배포 실패 → 만들어진 리소스 정리 시도")
-        _destroy(job, wd, final_status="failed")
-        return 1
+        resource_id = out["resource_id"]["value"]
+        health_url = out["health_url"]["value"]
+        step("health_check", endpoint=out["endpoint"]["value"], health_url=health_url,
+             resource_id=resource_id, image_uri=tjob["image_uri"])
 
-    endpoint = out["endpoint"]["value"]
-    health_url = out["health_url"]["value"]
-    write_result(job, status="health_check", endpoint=endpoint, health_url=health_url,
-                 resource_id=out["resource_id"]["value"])
+        timeout = int(os.environ.get("PAWPLOY_HEALTH_TIMEOUT") or HEALTH_TIMEOUT[tjob["architecture"]])
+        interval = int(os.environ.get("PAWPLOY_HEALTH_INTERVAL") or 10)
+        if not health.wait_healthy(health_url, timeout=timeout, interval=interval):
+            raise HealthCheckFailed(f"{health_url} 이 {timeout}초 안에 응답하지 않음")
+    except (tf.TerraformError, awscli.AwsError, iac.IacError, policy.PolicyError,
+            HealthCheckFailed, KeyError, OSError) as e:
+        return _fail(tjob, wd, stage, e, applied, resource_id)
 
-    timeout, interval = _health_params(job["architecture"])
-    ok = health.wait_healthy(health_url, timeout=timeout, interval=interval)
-    result = write_result(job, status="running" if ok else "unhealthy",
-                          deploy_seconds=int(time.time() - started))
-    if not ok:
-        _diagnose(job, wd, result)
-
-    print(f"\n[worker] 접속 주소: {endpoint}")
-    print(f"[worker] 만료 시각(UTC): {job['expires_at']}  →  그 전에 'python -m tfworker destroy {job['deploy_id']}'")
-    return 0 if ok else 3
+    write_target(job, cloud, status="running", deploy_seconds=int(time.time() - started))
+    return "running"
 
 
-def _diagnose(job: dict, wd: Path, result: dict) -> None:
-    diagnosis = diagnose.run(job, wd, result)
-    if diagnosis:
-        write_result(job, diagnosis=diagnosis)
+def _fail(tjob: dict, wd: Path | None, stage: str, e: Exception, applied: bool, resource_id: str | None) -> str:
+    """22단계 보고: 실패 단계·오류 로그·현재 상태. apply 를 시작했으면 지운 뒤 보고한다."""
+    cloud = tjob["cloud"]
+    error = f"출력 누락: {e}" if isinstance(e, KeyError) else str(e)
+    report = {"failed_stage": stage, "error": error, "log_tail": getattr(e, "output", "")[-4000:]}
+    if stage == "health_check":
+        report["app_log"] = diagnose.app_log(tjob, resource_id)   # 지우기 전에 앱 로그부터
+    print(f"[worker] {cloud}: {stage} 단계 실패 → {error.splitlines()[0]}", flush=True)
+
+    if not applied:   # apply 전 실패: 아직 아무것도 만들지 않았다
+        write_target(tjob, cloud, status="failed", destroyed=False, current_state=[], **report)
+        return "failed"
+
+    print(f"[worker] {cloud}: 만들어진 리소스 정리 → 수정본은 빈 상태에서 다시 배포", flush=True)
+    write_target(tjob, cloud, status="destroying", **report)
+    ok = _run_destroy(tjob, wd)
+    write_target(tjob, cloud, status="failed" if ok else "destroy_failed", destroyed=ok,
+                 current_state=_state_list(wd))
+    return "failed" if ok else "destroy_failed"
 
 
-def _destroy(job: dict, wd: Path, final_status: str = "destroyed") -> bool:
+def _run_destroy(tjob: dict, wd: Path) -> bool:
     try:
-        write_result(job, status="destroying")
         tf.run(wd, "destroy", "-auto-approve")
-        write_result(job, status=final_status, destroyed=True)
         return True
     except tf.TerraformError as e:
-        write_result(job, status="destroy_failed", error=str(e), log_tail=e.output[-4000:])
+        write_target(tjob, tjob["cloud"], destroy_error=str(e), destroy_log_tail=e.output[-4000:])
         return False
 
 
-def destroy(deploy_id: str) -> int:
-    wd = render.workdir_for(deploy_id)
-    job_file = wd / "job.json"
-    if not job_file.exists():
+def _state_list(wd: Path) -> list[str]:
+    """현재 state 에 남은 리소스 주소. 정리가 끝났으면 빈 목록."""
+    try:
+        return [line for line in tf.run(wd, "state", "list", capture_text=True).splitlines() if line.strip()]
+    except tf.TerraformError as e:
+        return [f"(state 를 읽지 못함: {e})"]
+
+
+# ---------------- destroy ----------------
+
+def destroy(deploy_id: str, cloud: str | None = None) -> int:
+    root = render.workdir_for(deploy_id)
+    if not any(root.glob("*/job.json")):
         try:
-            found = artifacts.download(deploy_id, wd)   # 다른 머신에서 배포한 경우
+            artifacts.download(deploy_id, root)   # 다른 머신에서 배포한 경우
         except awscli.AwsError as e:
             print(f"[worker] S3에서 작업 폴더를 받지 못했습니다: {e}")
-            found = False
-        if not found:
-            print(f"[worker] 배포를 찾을 수 없습니다: {deploy_id}")
-            return 2
-    job = json.loads(job_file.read_text(encoding="utf-8"))
+    dirs = sorted(p.parent for p in root.glob("*/job.json") if cloud in (None, p.parent.name))
+    if not dirs:
+        print(f"[worker] 배포를 찾을 수 없습니다: {deploy_id}{'/' + cloud if cloud else ''}")
+        return 2
 
-    # state가 없으면 terraform은 "지울 것이 없다"며 성공해 버린다. 리소스가 남지 않도록 막는다
-    if not job.get("state_bucket") and not (wd / "terraform.tfstate").exists():
-        write_result(job, status="destroy_failed",
-                     error="state를 찾을 수 없어 삭제 대상을 알 수 없습니다 (로컬 state가 없고 S3 backend도 아님)")
-        return 1
-
-    try:
-        tf.run(wd, "init", *render.backend_args(job))
-    except tf.TerraformError as e:
-        write_result(job, status="destroy_failed", error=str(e), log_tail=e.output[-4000:])
-        return 1
-    return 0 if _destroy(job, wd) else 1
+    result = load_result(deploy_id)
+    all_ok = True
+    for wd in dirs:
+        tjob = json.loads((wd / "job.json").read_text(encoding="utf-8"))
+        c = tjob["cloud"]
+        if result.get("targets", {}).get(c, {}).get("status") in ("failed", "destroyed"):
+            print(f"[worker] {c}: 지울 리소스 없음 (이미 정리됨)")
+            continue
+        # state가 없으면 terraform은 "지울 것이 없다"며 성공해 버린다. 리소스가 남지 않도록 막는다
+        if not tjob.get("state_bucket") and not (wd / "terraform.tfstate").exists():
+            write_target(tjob, c, status="destroy_failed",
+                         error="state를 찾을 수 없어 삭제 대상을 알 수 없습니다 (로컬 state가 없고 S3 backend도 아님)")
+            all_ok = False
+            continue
+        write_target(tjob, c, status="destroying")
+        try:
+            tf.run(wd, "init", *render.backend_args(tjob))
+        except tf.TerraformError as e:
+            write_target(tjob, c, status="destroy_failed", error=str(e), log_tail=e.output[-4000:])
+            all_ok = False
+            continue
+        ok = _run_destroy(tjob, wd)
+        write_target(tjob, c, status="destroyed" if ok else "destroy_failed", destroyed=ok,
+                     current_state=_state_list(wd))
+        all_ok = all_ok and ok
+    return 0 if all_ok else 1
 
 
 def status(deploy_id: str) -> int:
@@ -179,6 +259,8 @@ def status(deploy_id: str) -> int:
     print(path.read_text(encoding="utf-8"))
     return 0
 
+
+# ---------------- 만료 정리 ----------------
 
 def sweep(dry_run: bool) -> int:
     """만료됐는데 살아 있는 배포를 모두 destroy 한다. 정기 실행(크론 등) 용."""
@@ -202,7 +284,7 @@ def sweep(dry_run: bool) -> int:
 
 
 def orphans(region: str) -> int:
-    """pawploy 태그가 붙었는데 만료 시각이 지난 리소스를 찾아 보여 준다. 지우지는 않는다."""
+    """pawploy 태그가 붙었는데 만료 시각이 지난 리소스를 찾아 보여 준다. 지우지는 않는다. (AWS 만)"""
     try:
         found = expire.find_orphans(region)
     except awscli.AwsError as e:
@@ -223,8 +305,10 @@ def main(argv: list[str]) -> int:
         return sweep("--dry-run" in args)
     if cmd == "orphans" and len(args) <= 1:
         return orphans(args[0] if args else expire.DEFAULT_REGION)
-    if cmd in {"deploy", "destroy", "status"} and len(args) == 1:
-        return {"deploy": deploy, "destroy": destroy, "status": status}[cmd](args[0])
+    if cmd == "destroy" and len(args) in (1, 2) and (len(args) == 1 or args[1] in jobmod.CLOUD_ARCHITECTURES):
+        return destroy(*args)
+    if cmd in {"deploy", "status"} and len(args) == 1:
+        return {"deploy": deploy, "status": status}[cmd](args[0])
     print(__doc__)
     return 2
 

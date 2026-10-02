@@ -5,3 +5,4 @@ work/
 tfplan
 __pycache__/
 .env
+.venv/

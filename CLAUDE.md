@@ -1,7 +1,8 @@
 # CLAUDE.md: Pawploy Terraform Worker
 
 claude.ai에서 나눈 설계 대화를 정리한 컨텍스트입니다. 작업 전에 끝까지 읽어 주세요.
-(이전 문서에 있던 MBTI 추천, 3×3 매트릭스, 멀티 클라우드, 사용자 계정 배포 내용은 **모두 폐기**되었습니다.)
+(이전 문서에 있던 MBTI 추천, 3×3 매트릭스, 사용자 계정 배포 내용은 **모두 폐기**되었습니다.
+멀티 클라우드는 2026-10-02 에 "사용자가 AWS·GCP 중 배포할 곳을 고른다(둘 다 가능)"로 다시 범위에 들어왔습니다.)
 
 ---
 
@@ -10,9 +11,9 @@ claude.ai에서 나눈 설계 대화를 정리한 컨텍스트입니다. 작업 
 - **모든 답변은 한국어로.**
 - 사용자는 Terraform 초보입니다. 새 개념은 짧게 풀어서 설명하고, 명령 실행 전에 무엇을 하는지 한 줄로 말해 주세요.
 - 개발 환경은 **Windows + VS Code**입니다. 셸 명령은 PowerShell 또는 Git Bash 기준으로 안내하세요.
-- `terraform apply`/`destroy`, AWS 리소스 생성처럼 **비용이 생기는 명령은 실행 전에 반드시 확인**받으세요. `init`, `validate`, `plan`, `fmt`는 확인 없이 실행해도 됩니다.
-- AWS 키, `.env`, state 파일은 커밋하지 않습니다.
-- **현재 최우선 목표: "일단 실제로 배포가 되는 것".** 기능을 늘리기보다 EC2 한 바퀴(배포 → 접속 → 삭제)를 먼저 성공시키세요.
+- `terraform apply`/`destroy`, 클라우드 리소스 생성처럼 **비용이 생기는 명령은 실행 전에 반드시 확인**받으세요. `init`, `validate`, `plan`, `fmt`는 확인 없이 실행해도 됩니다.
+- AWS 키, GCP 서비스 계정 키(JSON), `.env`, state 파일은 커밋하지 않습니다.
+- **현재 최우선 목표: "일단 실제로 배포가 되는 것".** 기능을 늘리기보다 클라우드별 한 바퀴(배포 → 접속 → 삭제)를 먼저 성공시키세요.
 
 ---
 
@@ -21,169 +22,167 @@ claude.ai에서 나눈 설계 대화를 정리한 컨텍스트입니다. 작업 
 - **해커톤 주제**: One Action, Infinite Clouds: 로컬 웹앱을 원터치로 클라우드에 배포
 - **대상**: 인프라를 잘 모르는 초보 개발자(바이브 코더)
 - **목적**: 실제 클라우드에서 정상 배포되는지 확인하는 **테스트 환경 제공**
-- **클라우드**: AWS만 사용
+- **클라우드**: 사용자가 승인 단계에서 **AWS·GCP 중 고른다 (둘 다 가능)**. 배포는 우리 팀 계정(AWS 계정 / GCP 프로젝트)에
 
-### 아키텍처 (확정)
+### 파이프라인 (확정, 팀 시퀀스 다이어그램 기준)
 
 ```
-사용자(브라우저) → Frontend(React, GitHub Pages) ↔ Main Server(EC2, Fawploy API, 전체 흐름 조율)
-                                                    ├─ DynamoDB (메타데이터)
-                                                    └─ 업로드 버킷 (S3, presigned URL로 직접 업로드)
-
-⑤ 분석·추천   Main → Bedrock AgentCore: 에이전트가 S3 원본을 읽고 Claude로 배포 방식을 골라 결과 JSON을 S3에 저장
-⑥ 빌드        Main → Build Worker: S3 원본으로 Docker 이미지 빌드 → ECR 푸시
-⑦ 배포        Main → Terraform Worker: ECR 이미지 + 추천 결과로 Terraform 생성 → apply   ← 내 담당
-⑧ 결과 안내   엔드포인트와 배포 결과를 화면에 표시
+01~04  사용자 → Main: GitHub URL → 커밋 SHA 고정 소스 → S3 스냅샷
+05~08  Main → AgentCore: 분석 → Dockerfile·buildspec 생성 → 추천
+09~15  (병렬) CodeBuild 사전 빌드 → ECR (+ GCP 선택 시 Artifact Registry) 푸시 → digest
+16~17  (병렬) 사용자 검토: 추천안·이유·비용·권한 → 승인(클라우드 선택) 또는 수정 요청(05부터 반복)
+18~20  Main → AgentCore: 승인된 클라우드·추천안·digest 로 Terraform 모듈 생성 → S3 저장
+21~27  Main → Terraform Worker: IaC 검증·plan·apply → 실패 시 22(보고) → 23~25(AgentCore 수정) → 21 반복   ← 내 담당
+       성공 시 26(URL 확인) → 27(상태·리소스·URL 전달)
+28     Main → 사용자: 결과
 ```
 
 ### 확정된 결정
 
-- **배포는 우리(팀) AWS 계정에 한다.** 사용자 계정 배포 아님 → AssumeRole, 교차 계정 ECR 권한 필요 없음
+- **배포는 우리 팀 계정에 한다.** 사용자 계정 배포 아님
 - **악용 방지를 위해 1시간 타임아웃** 후 자동 삭제. 사용자가 직접 종료도 가능
-- 배포 대상 아키텍처: Lambda, EC2, ECS Fargate (SageMaker Endpoint는 일반 웹앱 이미지로 동작하지 않고 비싸서 **이번 범위에서 제외 권장**)
+- 배포 대상: AWS EC2·Lambda (ECS Fargate 예정), GCP Cloud Run. SageMaker 는 범위 밖
+- GCP 이미지는 **CodeBuild 가 ECR 과 Artifact Registry 양쪽에 푸시**하고 digest 를 넘긴다
+- AWS·GCP 동시 배포 중 **한쪽만 실패하면 성공한 쪽은 유지**하고, 실패한 클라우드만 재시도
 
 ---
 
-## 2. 내 담당: Terraform Worker
+## 2. 내 담당: Terraform Worker (21~27단계)
 
-> **입력**: Build Worker가 ECR에 푸시한 **이미지 주소** + AgentCore의 **추천 결과**
-> **출력**: 우리 계정에 배포된 앱의 **접속 주소**와 배포 상태
+> **입력**: 승인된 클라우드별 **이미지 digest** + AgentCore 가 S3 에 둔 **Terraform 모듈 위치**(`terraform_uri`)
+> **출력**: 클라우드별 **접속 주소·상태**, 실패 시 **실패 단계·오류 로그·현재 상태**
 
-### 설계 원칙
+### 설계 원칙 (2026-10-02 A안 확정)
 
-- **Terraform을 AI가 매번 생성하지 않는다.** 아키텍처별로 검증된 **모듈을 미리 만들어 두고**, 추천 결과에 맞는 모듈을 골라 **변수 파일만 생성**한다. 결과가 항상 같고 미리 테스트할 수 있음
-- **모든 모듈은 같은 입력, 같은 출력**을 가진다
-  - 입력: `name`, `image_uri`, `container_port`, `size`, `env`, `health_path`
-  - 출력: `endpoint`, `health_url`, `resource_id`
-- **배포마다 작업 폴더(`work/<deploy_id>/`)를 완결되게 만든다.** 모듈 코드까지 복사해 두므로 1시간 뒤 destroy 때 같은 코드로 정확히 지울 수 있음
-- 모든 리소스에 태그: `pawploy:managed=true`, `pawploy:project_id`, `pawploy:deploy_id`, `pawploy:expires_at`
+- **Terraform 은 AgentCore 가 만든다(18~19). 워커는 AI 없이 검증하고 실행만 한다.** (한때 넣었던 워커 내부 AI 생성 `aigen.py` 와 기본 모듈 자동 대체는 제거함)
+- 워커가 **루트 main.tf(provider·backend·필수 태그/label)를 직접 만들고**, 받은 코드는 `modules/app` 으로만 쓴다 → AgentCore 코드가 계정·state·태그를 바꿀 수 없음
+- 실행 전 **IaC 정적 검사**(`iac.py`) + apply 전 **plan 정책 검사**(`policy.py`). 이 두 검사가 사용자 코드에서 온 프롬프트 인젝션에 대한 실제 방어선
+- **실패하면 어느 단계든 만든 리소스를 지운 뒤 보고**한다 → 수정본 재요청(23~25 → 21)은 항상 빈 상태에서 시작. 정책의 "배포 중 삭제 금지"와도 충돌하지 않음
+- 워커가 AgentCore 를 직접 부르지 않는다. 실패 보고(22)를 Main Server 가 AgentCore 에 넘긴다
+- `modules/ec2`·`lambda`·`cloud_run` 은 **AgentCore 가 고칠 베이스**이자 `terraform_uri` 가 없을 때 쓰는 기본값
+- **모든 모듈은 같은 입력, 같은 출력**: 입력 `name`, `image_uri`, `container_port`, `size`, `env`, `health_path` / 출력 `endpoint`, `health_url`, `resource_id`
+- **클라우드마다 작업 폴더·state 를 따로** 둔다(`work/<deploy_id>/<cloud>/`). 모듈까지 복사해 두므로 1시간 뒤 destroy 때 같은 코드로 정확히 지움
+- 필수 태그: AWS `pawploy:managed`·`pawploy:project_id`·`pawploy:deploy_id`·`pawploy:expires_at` / GCP label 은 `:` 를 못 써서 `pawploy-managed` 등 하이픈 이름
 
-### 작업 입력 형식 (Main Server → Worker)
+### 작업 입력 (21단계) — 자세한 표는 README
 
 ```json
 {
-  "deploy_id": "dep-demo-ec2",
-  "project_id": "prj_demo",
-  "architecture": "ec2",
-  "image_uri": "<12자리계정>.dkr.ecr.ap-northeast-2.amazonaws.com/<저장소>:<태그 또는 @sha256:...>",
-  "container_port": 8080,
-  "size": "small",
-  "health_path": "/",
-  "env": { "APP_MODE": "test" }
+  "deploy_id": "dep-demo", "project_id": "prj_demo",
+  "container_port": 8080, "size": "small", "health_path": "/", "env": { "APP_MODE": "test" },
+  "targets": [
+    { "cloud": "aws", "architecture": "ec2", "image_uri": "<ECR>@sha256:...", "terraform_uri": "s3://.../aws/" },
+    { "cloud": "gcp", "architecture": "cloud_run", "image_uri": "<리전>-docker.pkg.dev/<프로젝트>/<저장소>/<이름>@sha256:...", "terraform_uri": "s3://.../gcp/" }
+  ]
 }
 ```
 
-- `architecture`: 현재 `ec2`, `lambda` 지원
-- `size`: `micro`, `small`, `medium`만 허용 (악용 방지)
-- `region`은 생략하면 이미지 주소에서 추출. Lambda는 이미지가 **같은 리전의 ECR**에 있어야 함
-- `ttl_minutes`는 최대 60분으로 고정
+- `targets` 없이 `architecture`·`image_uri` 를 최상위에 두면 AWS 하나 (이전 형식, `examples/job-ec2.json`)
+- GCP 이미지는 digest 필수(워커에 gcloud 없음). GCP 프로젝트·리전은 Artifact Registry 주소에서 추출
+- 살아 있는 클라우드를 다시 보내면 거부(종료 코드 2). 재시도는 `failed`·`destroyed` 클라우드만, 만료 시각은 처음 것 유지
 
-### 상태 흐름 (`work/<deploy_id>/result.json`의 `status`)
+### 상태 (`work/<deploy_id>/result.json`, 같은 내용이 DynamoDB 에도)
 
-`preparing → generating → init → plan → apply → health_check → running`
-실패: `failed` (진단 후 자동 destroy 시도) / 응답 없음: `unhealthy` (진단)
-삭제: `destroying → destroyed` / 삭제 실패: `destroy_failed`
+- 클라우드별 `targets.<cloud>.status`: `preparing → generating → init → plan → apply → health_check → running`
+  실패: 정리 후 `failed` (`failed_stage`·`error`·`log_tail`·`app_log`·`destroyed`·`current_state`) / 정리 실패: `destroy_failed`
+  삭제: `destroying → destroyed`
+- 전체 `status`: `deploying` / `running` / `partial` / `failed` / `destroying` / `destroyed` / `destroy_failed`
+- 응답 없음(`unhealthy`)은 따로 두지 않는다. 앱 로그를 모은 뒤 정리하고 `failed_stage: health_check` 로 보고
 
 ---
 
 ## 3. 현재 코드 상태
 
-**골조 (확정)**: AgentCore는 앞(분석·추천)과 뒤(실패 진단)에서만 쓴다. 아래 ①~⑤는 AI 없이 정해진 코드로 실행한다.
-자세한 입력·출력 형식은 README.md 참고.
-
 ```
 tfworker/
-  __main__.py        진입점: deploy / destroy / status / sweep / orphans
-  recommendation.py  ② AgentCore 추천 결과(recommendation_uri, S3 또는 로컬) 읽어 작업 입력에 합침
-  job.py             입력 검증 (허용 아키텍처·크기, ECR 주소 형식, 환경변수 이름, TTL 최대 60분, Lambda 리전=이미지 리전)
-  image.py           ① ECR에 이미지가 있는지 확인, 태그 → @sha256 digest 고정
-  render.py          ③ work/<deploy_id>/ 생성: main.tf, terraform.tfvars.json, job.json, 모듈 복사
-                        (PAWPLOY_DESTROY_QUEUE_ARN + PAWPLOY_SCHEDULER_ROLE_ARN 있으면 만료 destroy 예약 블록 포함)
-  artifacts.py       ④ 작업 폴더를 S3(PAWPLOY_ARTIFACT_BUCKET)에 보관, destroy 때 복원
-  terraform.py       ⑤ terraform CLI 실행 (로그 실시간 출력)
-  policy.py          apply 직전 plan(show -json) 검사: 허용 리소스 종류·인스턴스 타입·Lambda 크기·인바운드 80만·필수 태그
-  health.py          헬스체크 대기 (EC2 최대 420초, Lambda 최대 180초)
-  diagnose.py        failed/unhealthy 시 로그 수집 → AgentCore 진단 에이전트 호출 (PAWPLOY_DIAGNOSE_AGENT_ARN)
-  store.py           result.json 과 같은 내용을 DynamoDB(PAWPLOY_STATUS_TABLE)에 기록. 실패해도 배포는 계속
-  expire.py          만료 정리: sweep(로컬+DynamoDB 에서 만료 배포 찾아 destroy), orphans(태그로 남은 리소스 알림)
+  __main__.py        진입점: deploy / destroy [aws|gcp] / status / sweep / orphans. 클라우드별 순차 배포·실패 처리·결과 집계
+  job.py             21단계 입력 검증 (targets, 클라우드·아키텍처, ECR / Artifact Registry digest, 크기, env, TTL)
+  recommendation.py  (이전 형식용) recommendation_uri 를 읽어 작업 입력에 합침
+  image.py           AWS: ECR 이미지 확인, 태그 → @sha256 digest 고정
+  render.py          work/<deploy_id>/<cloud>/: 모듈 가져오기(terraform_uri: S3 / 로컬, 없으면 기본 모듈) + 루트 main.tf
+                     (AWS: default_tags, PAWPLOY_DESTROY_QUEUE_ARN+SCHEDULER_ROLE_ARN 있으면 만료 예약 / GCP: default_labels)
+  iac.py             IaC 정적 검사: 금지 문법, 허용 리소스·data 소스, file()/templatefile() 경로, 입출력 약속, IAM, 크레딧, deletion_protection
+  terraform.py       terraform CLI 실행 (로그 실시간 출력, json / text 캡처)
+  policy.py          plan(show -json) 검사: 리소스 종류·EC2 타입·크레딧·Lambda 크기·인바운드 80·IAM·Cloud Run 메모리/인스턴스/권한/삭제 보호·필수 태그/label
+  artifacts.py       검사를 통과한 작업 폴더를 S3(PAWPLOY_ARTIFACT_BUCKET)에 보관, destroy 때 복원
+  health.py          헬스체크 (EC2 420초, Lambda·Cloud Run 180초)
+  diagnose.py        응답 없음일 때 지우기 전 앱 로그 수집 (EC2 콘솔 / Lambda 로그. Cloud Run 은 아직)
+  store.py           result.json 을 DynamoDB(PAWPLOY_STATUS_TABLE)에도 기록. 실패해도 배포는 계속
+  expire.py          sweep(로컬+DynamoDB 에서 만료 배포 찾아 destroy), orphans(AWS 태그로 남은 리소스 알림)
   awscli.py          aws CLI 실행 도우미 (PAWPLOY_OFFLINE=1이면 AWS 호출 단계 건너뜀)
 modules/
-  ec2/            Amazon Linux 2023 + Docker. 기본 VPC, 80번 포트만 개방(SSH 닫음), ECR 읽기 권한,
-                  IMDSv2, 디스크 암호화, CPU 크레딧 standard(추가 과금 방지)
+  ec2/            Amazon Linux 2023 + Docker. 기본 VPC, 80번 포트만, ECR 읽기 권한, IMDSv2, 디스크 암호화, CPU 크레딧 standard
     user_data.sh.tftpl   부팅 시 Docker 설치 → ECR 로그인 → 이미지 실행 (-p 80:<container_port>)
-  lambda/         이미지 패키지 Lambda + 인증 없는 함수 URL, 로그 쓰기 권한만
+  lambda/         이미지 Lambda + 인증 없는 함수 URL(InvokeFunctionUrl + InvokeFunction), 로그 쓰기 권한만
+  cloud_run/      Cloud Run v2 + 권한 없는 앱 전용 서비스 계정 + allUsers 호출, 인스턴스 최대 1, deletion_protection=false
 examples/
-  job-ec2.json, job-lambda.json   작업 입력 예시 (image_uri는 실제 값으로 바꿔야 함)
-  sample-app/                     테스트용 이미지 (Python 웹앱 + Lambda Web Adapter 1.1.0, EC2·Lambda 겸용)
+  job-ec2.json, job-lambda.json (이전 형식), job-gcp.json, job-multi.json (targets 형식). image_uri 는 실제 값으로 바꿔 work/ 에 복사해 쓸 것
+  sample-app/     테스트용 이미지 (Python 웹앱 + Lambda Web Adapter 1.1.0, EC2·Lambda·Cloud Run 겸용, PORT 환경변수 사용)
 tools/
-  fake-terraform.py     가짜 terraform (FAKE_TF_FAIL, FAKE_TF_ENDPOINT, FAKE_TF_INSTANCE_TYPE, FAKE_TF_EXTRA_RESOURCE)
+  fake-terraform.py     가짜 terraform (FAKE_TF_FAIL, FAKE_TF_FAIL_CLOUD, FAKE_TF_ENDPOINT, FAKE_TF_INSTANCE_TYPE, FAKE_TF_EXTRA_RESOURCE, state list)
   fake-aws.py           가짜 aws CLI (FAKE_AWS_LOG 에 호출 기록, ECR·DynamoDB·S3·태그 조회 응답 흉내)
   push-sample-image.sh  샘플 이미지 linux/amd64 빌드 → ECR 푸시 (--provenance=false 필수, Lambda 가 이미지 인덱스를 거부)
 tests/
-  test_worker.py     unittest 19개. `python -m unittest -v` (비용 없음, 10초 내외)
+  test_worker.py     unittest 27개. `python -m unittest -v` (비용 없음, 30초 내외)
 ```
 
-- 같은 `deploy_id`로 살아 있는 배포가 있으면 deploy를 거부한다(`render.check_not_active`, 종료 코드 2). `destroyed`/`failed`면 재사용 가능
-- 헬스체크 시간은 `PAWPLOY_HEALTH_TIMEOUT` / `PAWPLOY_HEALTH_INTERVAL`로 줄일 수 있다(테스트용)
-- S3 backend는 `use_lockfile=true`로 잠금 → Terraform **1.10 이상** 필요 (루트 main.tf의 required_version)
+- S3 backend 는 `use_lockfile=true`로 잠금 → Terraform **1.10 이상**. key 는 `deployments/<project_id>/<deploy_id>/<cloud>.tfstate` (GCP state 도 S3)
+- GCP 인증은 `GOOGLE_APPLICATION_CREDENTIALS`(서비스 계정 **키 JSON 파일** 경로. 이메일 아님). 필요한 역할·API 는 README "GCP 준비"
+- `.venv/` 는 AI 생성 시험 때 만든 가상환경(anthropic SDK). 지금은 쓰지 않으므로 지워도 됨 (git 제외)
 
 ### 실행 방법
 
 ```bash
 python -m tfworker deploy examples/job-ec2.json
 python -m tfworker status dep-demo-ec2
-python -m tfworker destroy dep-demo-ec2
-python -m tfworker sweep --dry-run     # 만료된 배포 목록만 / --dry-run 빼면 destroy
-python -m tfworker orphans             # 태그로 만료 지난 리소스 목록 (삭제 안 함)
+python -m tfworker destroy dep-demo-ec2          # destroy dep-demo-multi gcp 처럼 클라우드 하나만도 가능
+python -m tfworker sweep --dry-run
+python -m tfworker orphans
 ```
-
-- state는 기본적으로 작업 폴더에 로컬 저장. 환경변수 `PAWPLOY_STATE_BUCKET`을 지정하면 S3 backend 사용 (`deployments/<project_id>/<deploy_id>.tfstate`)
-- `PAWPLOY_WORK_DIR`로 작업 폴더 위치 변경 가능, `TERRAFORM_BIN`으로 terraform 경로 지정 가능
-- Python 표준 라이브러리만 사용 (추가 설치 없음)
-- apply 전(init·plan·정책) 실패는 리소스가 없으므로 destroy 없이 `failed` → 같은 deploy_id 재사용 가능. apply 중 실패만 자동 destroy
 
 ### ⚠️ 검증 상태
 
-- 로컬 환경: Windows는 Terraform 1.16, AWS CLI v2, Python 3.14 (`python` 대신 `py`). Mac은 Terraform 1.16.4(Homebrew hashicorp/tap), Python은 `/opt/homebrew/bin/python3.12` (시스템 python3 3.9는 `str | None` 문법 때문에 안 됨), aws CLI·Docker 미설치
-- 확인된 것 (2026-10-02): `tests/` 19개 통과 (정상 / apply·init 실패 / unhealthy / 입력 오류 6종 / 정책 위반 2종 / 재배포 거부 / state 없는 destroy 거부 / 추천 병합 / ECR digest 고정 / S3 보관 제외 목록 / DynamoDB 기록 / sweep 로컬·DynamoDB / orphans / 스케줄러 렌더). 실제 terraform `validate`·`fmt` 통과 (EC2·Lambda·스케줄러 포함 루트, Terraform 1.16.4 + AWS provider 6.67.0)
-- **아직 확인 안 된 것**: 실제 AWS 배포, ECR digest 고정·S3 보관·DynamoDB 기록·태그 조회의 **실제 응답 형식**(가짜 aws 로 호출 인자만 검증함), EventBridge Scheduler 예약 실행, 진단 로그 수집, AgentCore 진단 호출
-- 해결된 의심 지점 (2026-10-02, 공식 문서 확인)
-  - `modules/lambda`: 2025-10부터 인증 없는 함수 URL은 `lambda:InvokeFunctionUrl` + `lambda:InvokeFunction`(`invoked_via_function_url`) 둘 다 필요 → 두 번째 권한 추가함
-  - `sample-app/Dockerfile`: Web Adapter `0.8.4`는 존재하지만 구버전 → 공식 README 권장 `1.1.0`으로 올림
-- 아직 남은 의심 지점
-  - `modules/ec2`: 팀 계정 서울 리전에 기본 VPC가 있는지 (`aws ec2 describe-vpcs --filters Name=isDefault,Values=true`)
-  - EC2 콘솔 출력은 부팅 몇 분 뒤에야 채워지므로 진단 로그가 비어 있을 수 있음
+- 로컬 환경: Windows는 Terraform 1.16, AWS CLI v2, Python 3.14 (`python` 대신 `py`). Mac은 Terraform 1.16.4, Python `/opt/homebrew/bin/python3.12` (시스템 python3 3.9는 `str | None` 문법 때문에 안 됨)
+- 확인된 것 (2026-10-02)
+  - `tests/` 27개 통과: 단일·멀티 클라우드, GCP 단독, 한쪽 실패 후 그쪽만 재시도·만료 시각 유지, 단계별 실패 보고(apply·init·plan·health_check)·정리, AgentCore 모듈 사용·IaC 거부·정책 거부, 입력 오류 11종, 클라우드 하나만 destroy, state 없는 destroy 거부, sweep·orphans, digest 고정·DynamoDB 기록
+  - 실제 terraform `validate`·`fmt` 통과: EC2·Lambda·Cloud Run (AWS provider 6.67, Google provider 6.50, deploy_id 40자)
+  - 실제 terraform `plan` 으로 새 AWS 정책 검사(IAM 정책 허용 목록·크레딧) 통과 확인
+  - **실제 AWS EC2 한 바퀴 성공** (`dep-demo-ec2b`, 249초) — 단, `targets` 구조로 바꾸기 전 코드
+- **아직 확인 안 된 것**: 바뀐 구조로 EC2 재확인, Lambda·Cloud Run 실제 배포, AWS+GCP 동시 실제 배포, Cloud Run plan JSON 의 실제 필드 형식(`terraform_labels`, `template[].scaling` — 가짜 plan 으로만 검증), S3·DynamoDB·Scheduler 실제 호출
+- 해결된 의심 지점
+  - `modules/lambda`: 인증 없는 함수 URL은 `lambda:InvokeFunctionUrl` + `lambda:InvokeFunction`(`invoked_via_function_url`) 둘 다 필요
+  - `modules/ec2` 기본 VPC: 인터넷 게이트웨이가 지워져 경로가 `blackhole`이었음 → `default-vpc-igw` 연결로 해결. EC2 헬스체크가 `URLError`만 반복하면 이것부터 확인
+  - IAM `name_prefix` 는 `substr(var.name, 0, 37)` (38 이면 deploy_id 30자 이상에서 plan 실패)
+  - Cloud Run `deletion_protection` 기본값이 true 라 그대로 두면 destroy 가 실패함 → 모듈·검사에서 false 강제
+  - Cloud Run 에 `PORT` 환경변수를 직접 넣으면 거부됨 (Cloud Run 이 container_port 로 자동 설정)
 
 ---
 
 ## 4. 다음 할 일 (순서대로)
 
-1. [ ] terraform(1.10 이상, AWS provider 6.28 이상 자동 설치)과 AWS CLI 설치·로그인 확인 (`terraform -version`, `aws sts get-caller-identity`)
-2. [ ] 샘플 이미지를 **linux/amd64**로 빌드해서 ECR에 푸시 (팀 계정, 서울 리전) → `tools/push-sample-image.sh` 한 번 실행
-3. [ ] `examples/job-ec2.json`의 `image_uri`를 실제 값으로 바꾸고, 작업 폴더에서 `terraform validate`·`plan`으로 오류 수정
-4. [ ] **사용자 확인 후** EC2 실제 배포 → 접속 확인 → destroy (한 바퀴 성공이 최우선)
-5. [ ] Lambda도 같은 방식으로 한 바퀴
-6. [x] apply 실패 경로와 입력 오류 경로 테스트 (가짜 terraform·aws 로. 실제 AWS 응답 형식은 4·5번에서 확인)
-7. [x] **1시간 자동 삭제** 코드: Scheduler 예약(`render.py`, 환경변수 있을 때) + `sweep` 정기 점검 + `orphans` 태그 알림 (`expire.py`)
-   - [ ] 팀 계정에 상태 테이블·destroy 큐·Scheduler 역할 만들기 (README "1시간 자동 삭제" 의 명령) + `sweep` 을 5~10분 주기로 돌릴 자리 정하기
-8. [x] 상태를 **DynamoDB**에도 기록 (`store.py`, `PAWPLOY_STATUS_TABLE`). `result.json` 은 로컬 기록으로 유지
-9. [ ] Main Server와 연결 방식 결정 (SQS로 받을지, CodeBuild/ECS 작업으로 실행할지). **Lambda에서 실행은 비추천** (15분 제한). destroy 큐 소비자도 여기서 함께
-10. [ ] ECS Fargate 모듈 추가 (공용 ALB를 미리 만들어 두고 배포마다 대상 그룹 + 리스너 규칙만 추가하는 방식 권장). 추가 시 `policy.ALLOWED_TYPES` 에도 등록
-11. [x] plan 결과(`terraform show -json`) 정책 검사 (`policy.py`): 허용 리소스 종류, 인스턴스 타입, Lambda 메모리·타임아웃, 인바운드 80만, 필수 태그
+1. [x] terraform·AWS CLI 설치·로그인, 샘플 이미지 ECR 푸시, EC2 한 바퀴 (2026-10-02)
+2. [ ] **바뀐 구조(targets)로 EC2 한 바퀴 재확인** ← 다음 최우선
+3. [ ] GCP 서비스 계정 키 준비 → 샘플 이미지 Artifact Registry 푸시 → Cloud Run 한 바퀴
+4. [ ] AWS + GCP 동시 한 바퀴, Lambda 한 바퀴 (Lambda 전에 Web Adapter 1.1.0 으로 이미지 다시 빌드)
+5. [ ] AgentCore 담당과 모듈 약속(README "AgentCore 가 만들 Terraform 모듈") 확정, S3 경로 규칙 정하기
+6. [ ] Main Server와 연결 방식 결정 (SQS / CodeBuild / ECS 작업). **Lambda에서 실행은 비추천** (15분 제한). destroy 큐 소비자도 함께
+7. [ ] 팀 계정에 상태 테이블·destroy 큐·Scheduler 역할 만들기 + `sweep` 을 5~10분 주기로 돌릴 자리
+8. [ ] GCP label 기반 남은 리소스 감시 (`orphans` 의 GCP 판), Cloud Run 앱 로그 수집
+9. [ ] ECS Fargate 모듈 (공용 ALB + 배포별 대상 그룹·리스너 규칙). 추가 시 `job.CLOUD_ARCHITECTURES`·`policy.ALLOWED_TYPES` 에도 등록
 
 ---
 
 ## 5. 우리 계정에 배포하므로 지켜야 할 것
 
-- **격리**: 사용자 앱의 IAM 역할에는 로그 쓰기와 ECR 읽기만. Pawploy 업로드 버킷·DynamoDB 접근 권한은 절대 주지 않기
-- **워커 권한 제한**: 워커 IAM 역할은 `pawploy:managed` 태그가 붙은 리소스와 `pawploy-` 이름 접두사로 제한, IAM 역할 생성 시 권한 경계 강제
-- **악용 방지**: 크기 제한, CPU 크레딧 standard, Lambda 짧은 타임아웃, ECS `desired_count = 1`, 동시 배포 수·시간당 배포 횟수 제한(Main Server), GPU·SageMaker 금지, AWS Budgets 알림
+- **격리**: 사용자 앱의 권한은 로그 쓰기·이미지 읽기만. AWS 는 관리형 정책 2개만 허용, GCP 는 역할 없는 앱 전용 서비스 계정(기본 Compute 계정은 편집자 권한이라 금지)
+- **워커 권한**: 지금은 관리자 권한으로 시험 중. 서버로 옮길 때 `pawploy:managed` 태그·`pawploy-` 접두사로 제한, IAM 역할 생성 시 권한 경계. 워커 권한이 넓으므로 AgentCore 코드가 워커 파일·비밀값·토큰을 읽지 못하게 `iac.py` 로 막는다
+- **악용 방지**: 크기 제한, CPU 크레딧 standard, Lambda 짧은 타임아웃, Cloud Run 인스턴스 최대 1, ECS `desired_count = 1`, 동시 배포 수·시간당 배포 횟수 제한(Main Server), GPU·SageMaker 금지, AWS Budgets·GCP 예산 알림
 - **삭제가 배포보다 중요**: destroy가 확실히 되는 것이 비용·악용 관리의 핵심
 
 ---
 
 ## 6. 팀원과 맞춰야 할 약속
 
-- **AgentCore 담당**: 추천 결과 JSON에서 읽을 필드(아키텍처 이름 `ec2`/`lambda`/`ecs_fargate`, 포트, 헬스체크 경로, 크기, 환경변수 이름)
-- **Build Worker 담당**: 이미지 주소 형식(digest `@sha256:` 권장), `linux/amd64`, **Lambda용 이미지에 Lambda Web Adapter 포함**, ECR 리전
-- **Main Server 담당**: 작업 입력 형식(위 2절), 호출 방식, 상태 기록 위치, 사용자 종료 요청 방법, 사용자 비밀값 전달 방식
+- **AgentCore 담당**: 클라우드별 Terraform 모듈 형식(입력 6개·출력 3개, provider·backend 금지, 금지 문법 목록), S3 저장 경로, 아키텍처 이름 `ec2`/`lambda`/`cloud_run`(/`ecs_fargate`)
+- **Build Worker 담당**: ECR + (GCP 선택 시) Artifact Registry 푸시, digest(`@sha256:`) 전달, `linux/amd64`, **Lambda용 이미지에 Lambda Web Adapter 포함**, 앱은 `PORT` 환경변수로 포트를 받기
+- **Main Server 담당**: 21단계 입력 형식(`targets`), 호출 방식, 결과(`result.json` / DynamoDB) 읽는 법, 22단계 보고를 AgentCore 에 넘기는 방식, 재시도 시 실패한 클라우드만 보내기, 사용자 종료 요청

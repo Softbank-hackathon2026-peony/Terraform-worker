@@ -1,0 +1,20 @@
+{
+  "deploy_id": "dep-demo-multi",
+  "project_id": "prj_demo",
+  "container_port": 8080,
+  "size": "small",
+  "health_path": "/",
+  "env": { "APP_MODE": "test" },
+  "targets": [
+    {
+      "cloud": "aws",
+      "architecture": "ec2",
+      "image_uri": "123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/pawploy-sample:latest"
+    },
+    {
+      "cloud": "gcp",
+      "architecture": "cloud_run",
+      "image_uri": "asia-northeast3-docker.pkg.dev/my-gcp-project/pawploy/pawploy-sample@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ]
+}

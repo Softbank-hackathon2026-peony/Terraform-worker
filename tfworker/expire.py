@@ -19,7 +19,7 @@ DEFAULT_REGION = os.environ.get("PAWPLOY_REGION", "ap-northeast-2")
 TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 # 다른 프로세스가 지금 작업 중일 수 있는 상태. 만료 직후라면 끼어들지 않고 다음 점검으로 미룬다
-IN_PROGRESS_STATUSES = {"preparing", "generating", "init", "plan", "apply", "health_check", "destroying"}
+IN_PROGRESS_STATUSES = {"deploying", "destroying"}   # result.json 의 전체 상태 (render·__main__ 의 aggregate)
 IN_PROGRESS_GRACE_SEC = 15 * 60   # 헬스체크 최대 7분 + 여유
 
 
