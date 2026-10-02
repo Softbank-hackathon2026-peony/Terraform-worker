@@ -116,7 +116,10 @@ tfworker/
   (policy·iac)       + 앱 권한 탈취 차단: EC2 프로필·Lambda 역할·Cloud Run 서비스 계정은 이 배포에서 만든 것만
                        (AWS 는 plan 에서 값이 정해져 있으면 기존 것, GCP 는 만든 계정 이메일과 비교·미지정 거부), 만료 예약은 루트에서만
 Dockerfile         워커 실행 이미지 (python 3.12 + terraform 1.16.0 체크섬 검증 + aws CLI, 사용자 worker, /work)
-infra/setup-aws.sh S3 버킷·DynamoDB·SQS·Scheduler 역할 생성 (기본 출력만, --apply 로 생성). 아직 실행 안 함
+infra/setup-aws.sh S3 버킷·DynamoDB·SQS·Scheduler 역할(ppw-scheduler) 생성 (기본 출력만, --apply 로 생성)
+infra/setup_fargate.py  위 기본 + SQS FIFO pawploy-jobs.fifo(+DLQ)·ECR·Secrets Manager(GCP 키)·로그·IAM(ppw-ecs-execution/ppw-worker-task)
+                   ·ECS 클러스터 pawploy·서비스 pawploy-tf-worker(consume, 0.5vCPU/2GB 상시 1개). 이미지 태그 = git short SHA
+tfworker/consume.py  작업 큐 소비자: {action:deploy, job_uri:s3://...} / {action:destroy, deploy_id, cloud?}, 5분마다 maintenance
 modules/
   ec2/            Amazon Linux 2023 + Docker. 기본 VPC, 80번 포트만, ECR 읽기 권한, IMDSv2, 디스크 암호화, CPU 크레딧 standard
     user_data.sh.tftpl   부팅 시 Docker 설치 → ECR 로그인 → 이미지 실행 (-p 80:<container_port>)
@@ -157,7 +160,8 @@ python -m tfworker orphans
   - **실제 AWS EC2 한 바퀴 성공** (`dep-demo-ec2b`, 249초) — `targets` 구조로 바꾸기 전 코드
   - **바뀐 구조(targets)로 EC2 한 바퀴 재확인 성공** (`dep-demo-ec2c`): ECR 태그 → digest 고정 → IaC 검사 → plan 정책 검사(5개) → apply → 헬스체크 200(121초) → 접속 확인 → destroy(5개), 남은 EC2·IAM 역할 없음
   - **실제 GCP Cloud Run 한 바퀴 성공** (`dep-demo-gcp`, 프로젝트 `softbankhackathon2026-peony`, 서울 리전 저장소 `pawploy`): 실제 plan JSON 으로 정책 검사 필드(`terraform_labels`·`template[].scaling`·`deletion_protection`) 확인 → 첫 apply 403 → 실패 보고·정리(`current_state: []`) → 권한 추가 후 같은 deploy_id 재시도 → `running`(헬스체크 200) → 앱 전용 계정 `pp-dep-demo-gcp` 로 실행 확인 → destroy 후 남은 리소스 없음
-- **아직 확인 안 된 것**: Lambda 실제 배포, AWS+GCP 동시 실제 배포, S3·DynamoDB·Scheduler 실제 호출
+- **SQS + Fargate 워커 가동 (2026-10-02, 이미지 6b2389e)**: 서비스 실행, maintenance(만료 큐·DynamoDB scan) 동작, S3 작업 JSON → 큐 메시지 → 입력 오류 거부 → DynamoDB `status=rejected` → 메시지 삭제·작업 보호 켜고 끄기 확인 (`dep-queue-test`)
+- **아직 확인 안 된 것**: Fargate 워커로 실제 배포(EC2·Cloud Run), Lambda 실제 배포, AWS+GCP 동시 실제 배포, Scheduler 만료 예약 실제 동작
 - 해결된 의심 지점
   - `modules/lambda`: 인증 없는 함수 URL은 `lambda:InvokeFunctionUrl` + `lambda:InvokeFunction`(`invoked_via_function_url`) 둘 다 필요
   - `modules/ec2` 기본 VPC: 인터넷 게이트웨이가 지워져 경로가 `blackhole`이었음 → `default-vpc-igw` 연결로 해결. EC2 헬스체크가 `URLError`만 반복하면 이것부터 확인
@@ -179,7 +183,7 @@ python -m tfworker orphans
 6. [ ] Main Server와 연결 방식 결정 (SQS / CodeBuild / ECS 작업). **Lambda에서 실행은 비추천** (15분 제한). 사용자가 Main 담당과 논의 중
    - [x] 연결 방식과 무관한 준비 (2026-10-02): 입력 오류 기록, DynamoDB 잠금·결과 이어받기, 만료 큐 소비자(`drain-destroy-queue`), 워커 컨테이너 이미지(컨테이너 안에서 GCP plan 확인)
    - [ ] 정해지면: 입구(입력을 메시지/S3 경로로 받기), 결과 알림, 워커 실행 역할(최소 권한), GCP 키를 Secrets Manager 로
-7. [ ] 팀 계정에 S3·상태 테이블·destroy 큐·Scheduler 역할 만들기 (`infra/setup-aws.sh --apply`, 사용자 확인 후) + `sweep`·`drain-destroy-queue` 를 5~10분 주기로 돌릴 자리
+7. [x] (2026-10-02 setup_fargate.py --apply) 팀 계정에 S3·상태 테이블·destroy 큐·Scheduler 역할 만들기 (`infra/setup-aws.sh --apply`, 사용자 확인 후) + `sweep`·`drain-destroy-queue` 를 5~10분 주기로 돌릴 자리
 8. [ ] GCP label 기반 남은 리소스 감시 (`orphans` 의 GCP 판), Cloud Run 앱 로그 수집
 9. [ ] ECS Fargate 모듈 (공용 ALB + 배포별 대상 그룹·리스너 규칙). 추가 시 `job.CLOUD_ARCHITECTURES`·`policy.ALLOWED_TYPES` 에도 등록
 
