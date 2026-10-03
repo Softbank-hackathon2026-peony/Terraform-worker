@@ -42,7 +42,7 @@ def _job(workdir: Path) -> dict:
 
 
 def _fake_plan(workdir: Path) -> dict:
-    """실제 모듈(modules/ec2, lambda, cloud_run)이 만드는 리소스와 같은 종류·속성을 가진 plan JSON."""
+    """실제 모듈(modules/ec2, ec2_compose, lambda, cloud_run)이 만드는 리소스와 같은 종류·속성을 가진 plan JSON."""
     architecture = _job(workdir).get("architecture", "ec2")
 
     if architecture == "cloud_run":
@@ -81,6 +81,9 @@ def _fake_plan(workdir: Path) -> dict:
                     {"instance_type": os.environ.get("FAKE_TF_INSTANCE_TYPE", "t3.small"),
                      "credit_specification": [{"cpu_credits": "standard"}]}),
         ]
+        if architecture == "ec2_compose":   # 데이터 저장소 비밀번호 (modules/ec2_compose)
+            changes.append(_change('module.app.random_password.datastore["postgres"]', "random_password",
+                                   {"length": 24, "special": False}, tagged=False))
     extra = os.environ.get("FAKE_TF_EXTRA_RESOURCE")
     module_tf = workdir / "modules" / "app" / "main.tf"
     if not extra and module_tf.exists() and "FAKE_POLICY_VIOLATION" in module_tf.read_text(encoding="utf-8"):

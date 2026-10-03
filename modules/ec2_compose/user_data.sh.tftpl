@@ -1,0 +1,72 @@
+#!/bin/bash
+# EC2 첫 부팅 때 실행 (여러 컨테이너, Docker Compose). 로그: /var/log/pawploy-bootstrap.log (콘솔 출력에도 남음)
+set -euo pipefail
+exec > >(tee -a /var/log/pawploy-bootstrap.log) 2>&1
+echo "[pawploy] start $(date -Is)"
+
+# 실패하면 컨테이너 상태·로그를 콘솔에 남긴다 (워커가 지우기 전에 get-console-output 으로 모음)
+report() {
+  cd /opt/pawploy 2>/dev/null || return 0
+  docker compose ps -a || true
+  docker compose logs --tail 40 --no-color || true
+}
+trap 'echo "[pawploy] ERROR: line $LINENO"; report' ERR
+
+dnf install -y docker
+mkdir -p /etc/docker
+cat > /etc/docker/daemon.json <<'JSONEOF'
+{"log-driver": "json-file", "log-opts": {"max-size": "10m", "max-file": "3"}}
+JSONEOF
+systemctl enable --now docker
+
+# Docker Compose 플러그인 (Amazon Linux 2023 저장소에 없음). 버전·체크섬 고정
+COMPOSE_URL="https://github.com/docker/compose/releases/download/v2.39.4/docker-compose-linux-x86_64"
+COMPOSE_SHA256="7af95166a730b87e172d4fc9aefea8725d3c6c7327d59149267b452114ddb7d4"
+for i in 1 2 3 4 5; do
+  if curl -fsSL -o /tmp/docker-compose "$COMPOSE_URL"; then
+    break
+  fi
+  echo "[pawploy] compose download retry $i"
+  sleep 5
+done
+echo "$COMPOSE_SHA256  /tmp/docker-compose" | sha256sum -c -
+install -D -m 755 /tmp/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose
+docker compose version
+
+%{ for registry, region in registries ~}
+%{ if region != "" ~}
+for i in 1 2 3 4 5; do
+  if aws ecr get-login-password --region "${region}" \
+      | docker login --username AWS --password-stdin "${registry}"; then
+    break
+  fi
+  echo "[pawploy] ecr login retry $i"
+  sleep 5
+done
+%{ endif ~}
+%{ endfor ~}
+
+# compose 파일 (데이터 저장소 비밀번호 포함 → root 만 읽기)
+mkdir -p /opt/pawploy
+echo '${compose_gz_b64}' | base64 -d | gunzip > /opt/pawploy/compose.yaml
+chmod 600 /opt/pawploy/compose.yaml
+cd /opt/pawploy
+
+for i in 1 2 3 4 5 6; do
+  if docker compose pull --quiet; then
+    break
+  fi
+  if [ "$i" -eq 6 ]; then
+    echo "[pawploy] ERROR: pull failed"
+    exit 1
+  fi
+  echo "[pawploy] pull retry $i"
+  sleep 10
+done
+
+docker compose up -d --remove-orphans
+
+# 앱이 응답하지 않을 때 원인을 볼 수 있게 잠시 뒤 상태·로그 끝부분을 남긴다
+sleep 30
+report
+echo "[pawploy] done $(date -Is)"

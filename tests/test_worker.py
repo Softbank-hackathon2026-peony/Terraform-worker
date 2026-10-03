@@ -551,6 +551,169 @@ locals {
                          "google_project_iam_member"):
             self.assertIn(expected, v)
 
+    # ---------- 여러 컨테이너 (ec2_compose) ----------
+
+    def test_ec2_compose_deploy_and_destroy(self):
+        job = self.write_targets([{"cloud": "aws", "architecture": "ec2_compose", "images": COMPOSE_IMAGES}],
+                                 deploy_id="dep-compose")
+        code, out = self.run_worker("deploy", job)
+        self.assertEqual(code, 0, out)
+        t = self.target("aws", "dep-compose")
+        self.assertEqual((t["status"], t["architecture"], t["terraform_source"]),
+                         ("running", "ec2_compose", "modules/ec2_compose"))
+        self.assertEqual(t["images"], COMPOSE_IMAGES)
+        self.assertNotIn("image_uri", t)
+
+        wd = self.tdir("aws", "dep-compose")
+        self.assertTrue((wd / "modules" / "app" / "compose.yaml.tftpl").exists())
+        tfvars = json.loads((wd / "terraform.tfvars.json").read_text(encoding="utf-8"))
+        self.assertEqual(tfvars["images"], COMPOSE_IMAGES)
+        for absent in ("image_uri", "container_port", "env"):
+            self.assertNotIn(absent, tfvars, "ec2_compose 모듈 입력은 name·images·size·health_path 뿐")
+        main_tf = (wd / "main.tf").read_text(encoding="utf-8")
+        self.assertIn('images      = var.images', main_tf)
+        self.assertIn('source  = "hashicorp/random"', main_tf, "random provider 는 워커 루트에서 고정")
+        self.assertNotIn("var.image_uri", main_tf)
+        self.assertIn("random_password", (wd / "plan.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(self.run_worker("destroy", "dep-compose")[0], 0)
+        self.assertEqual(self.result("dep-compose")["status"], "destroyed")
+
+    def test_single_image_root_is_unchanged(self):
+        # 컨테이너 1개 아키텍처의 루트는 예전 그대로 (random provider·images 없음)
+        self.assertEqual(self.run_worker("deploy", self.write_job())[0], 0)
+        main_tf = (self.tdir() / "main.tf").read_text(encoding="utf-8")
+        self.assertNotIn("hashicorp/random", main_tf)
+        self.assertNotIn("images", main_tf)
+        tfvars = json.loads((self.tdir() / "terraform.tfvars.json").read_text(encoding="utf-8"))
+        self.assertEqual(set(tfvars), {"region", "project_id", "deploy_id", "expires_at", "image_uri",
+                                       "container_port", "size", "health_path", "env"})
+        self.assertEqual(self.target()["architecture"], "ec2")
+
+    def test_ec2_compose_input_errors_return_2(self):
+        other_region = "123456789012.dkr.ecr.us-east-1.amazonaws.com/x:latest"
+        cases = {
+            "not_ecr": {"images": {"web": "docker.io/library/nginx:latest"}},
+            "mixed_regions": {"images": {"app": COMPOSE_IMAGES["app"], "worker": other_region}},
+            "bad_id": {"images": {"-bad id": COMPOSE_IMAGES["app"]}},
+            "empty": {"images": {}},
+            "not_map": {"images": [COMPOSE_IMAGES["app"]]},
+            "both": {"images": COMPOSE_IMAGES, "image_uri": AWS_IMAGE},
+            "compose_needs_images": {"architecture": "ec2_compose", "image_uri": AWS_IMAGE},
+            "single_arch_with_images": {"architecture": "lambda", "images": COMPOSE_IMAGES},
+            "gcp_images": {"cloud": "gcp", "images": {"app": GCP_IMAGE}},
+        }
+        for name, target in cases.items():
+            with self.subTest(case=name):
+                code, out = self.run_worker("deploy", self.write_targets([{"cloud": "aws", **target}],
+                                                                          name=f"bad-{name}.json"))
+                self.assertEqual(code, 2, out)
+                self.assertIn("입력 오류", out)
+
+    def test_ec2_compose_pins_every_image_to_digest(self):
+        env = self.aws_env()
+        job = self.write_targets([{"cloud": "aws", "images": COMPOSE_IMAGES}], deploy_id="dep-compose")
+        code, out = self.run_worker("deploy", job, **env)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(self.aws_calls("ecr", "describe-images")), len(COMPOSE_IMAGES), "이미지마다 확인")
+        tfvars = json.loads((self.tdir("aws", "dep-compose") / "terraform.tfvars.json").read_text(encoding="utf-8"))
+        registry = "123456789012.dkr.ecr.ap-northeast-2.amazonaws.com"
+        self.assertEqual(tfvars["images"], {"app": f"{registry}/board@sha256:" + "a" * 64,
+                                            "worker": f"{registry}/board-worker@sha256:" + "a" * 64})
+        self.assertEqual(self.target("aws", "dep-compose")["images"], tfvars["images"])
+        self.assertEqual(self.target("aws", "dep-compose")["architecture"], "ec2_compose",
+                         "architecture 를 생략하고 images 만 넘기면 기본 모듈은 ec2_compose")
+
+    def test_ec2_compose_architecture_comes_from_module(self):
+        """aws_instance 모듈 중 compose.yaml.tftpl 이 있으면 ec2_compose. 이미지 입력 모양과 다르면 generating 실패."""
+        root = self.tmp / "s3" / "agentbkt" / "projects" / "prj_test" / "deploy"
+        shutil.copytree(self.module_dir("ec2_compose"), root / "dep-compose" / "attempt-1" / "aws")
+        shutil.copytree(self.module_dir("ec2"), root / "dep-ec2-img" / "attempt-1" / "aws")
+        shutil.copytree(self.module_dir("ec2_compose"), root / "dep-cmp-uri" / "attempt-1" / "aws")
+        env = self.aws_env(PAWPLOY_AGENT_BUCKET="agentbkt", FAKE_AWS_S3_ROOT=str(self.tmp / "s3"))
+
+        code, out = self.run_worker("deploy", self.write_targets([{"cloud": "aws", "images": COMPOSE_IMAGES}],
+                                                                  deploy_id="dep-compose"), **env)
+        self.assertEqual(code, 0, out)
+        t = self.target("aws", "dep-compose")
+        self.assertEqual((t["status"], t["architecture"]), ("running", "ec2_compose"))
+        self.assertTrue(t["terraform_source"].endswith("/dep-compose/attempt-1/aws/"))
+
+        cases = (("dep-ec2-img", {"images": COMPOSE_IMAGES}, "image_uri 하나만"),          # ec2 모듈 + images
+                 ("dep-cmp-uri", {"image_uri": AWS_IMAGE}, "images(이미지 id"))            # compose 모듈 + image_uri
+        for deploy_id, image_input, expected in cases:
+            with self.subTest(deploy_id=deploy_id):
+                code, out = self.run_worker("deploy", self.write_targets([{"cloud": "aws", **image_input}],
+                                                                          name=f"{deploy_id}.json", deploy_id=deploy_id),
+                                            **env)
+                self.assertEqual(code, 1, out)
+                t = self.target("aws", deploy_id)
+                self.assertEqual((t["status"], t["failed_stage"]), ("failed", "generating"))
+                self.assertIn(expected, t["error"])
+
+    def test_ec2_compose_iac_checks(self):
+        sys.path.insert(0, str(ROOT))
+        from tfworker import iac, render
+        compose_dir = ROOT / "modules" / "ec2_compose"
+        self.assertEqual(iac.find_violations(compose_dir, "aws", "ec2_compose"), [], "기본 모듈은 검사를 통과해야 함")
+        self.assertEqual(render.detect_architecture(compose_dir), "ec2_compose")
+        self.assertEqual(render.detect_architecture(ROOT / "modules" / "ec2"), "ec2")
+
+        code = (compose_dir / "main.tf").read_text(encoding="utf-8")
+        # 같은 코드라도 ec2 로 검사하면 random_password·hashicorp/random 은 허용 밖, 입력 약속도 다름
+        joined = "\n".join(iac.check_code(code, "aws", "ec2"))
+        for expected in ("random_password", "hashicorp/random", "입력 변수 누락: image_uri"):
+            self.assertIn(expected, joined)
+
+        bad = code.replace('variable "images" { type = map(string) }', "") + """
+provider "random" {}
+locals {
+  leak = file("/home/worker/.aws/credentials")
+}
+resource "aws_s3_bucket" "b" {}
+"""
+        joined = "\n".join(iac.check_code(bad, "aws", "ec2_compose"))
+        for expected in ("provider 블록", "file()", "aws_s3_bucket", "입력 변수 누락: images"):
+            self.assertIn(expected, joined)
+
+        template = (compose_dir / "compose.yaml.tftpl").read_text(encoding="utf-8")
+        joined = "\n".join(iac.check_template("compose.yaml.tftpl", template + """
+  evil:
+    image: alpine
+    privileged: true
+    network_mode: host
+    build: .
+    environment:
+      LEAK: "${file("/home/worker/.aws/credentials")}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+"""))
+        for expected in ("file()", "privileged", "host", "Docker 소켓", "build"):
+            self.assertIn(expected, joined)
+
+        # 템플릿이 쓰는 이미지 id 가 작업 입력에 없으면 plan 전에 거부
+        self.assertEqual(iac.find_violations(compose_dir, "aws", "ec2_compose", COMPOSE_IMAGES), [])
+        self.assertIn('images["app"] 가 작업 입력 images 에 없음',
+                      "\n".join(iac.find_violations(compose_dir, "aws", "ec2_compose", {"web": AWS_IMAGE})))
+
+        # compose.yaml.tftpl 이 없으면 ec2_compose 모듈이 아님
+        no_template = Path(self.module_dir("ec2_compose"))
+        (no_template / "compose.yaml.tftpl").unlink()
+        self.assertIn("compose.yaml.tftpl", "\n".join(iac.find_violations(no_template, "aws", "ec2_compose")))
+
+    def test_policy_allows_random_password_only_for_ec2_compose(self):
+        sys.path.insert(0, str(ROOT))
+        from tfworker import policy
+        tags = {"tags_all": {t: "v" for t in policy.REQUIRED_TAGS}}
+        changes = {"resource_changes": [
+            {"address": "module.app.aws_instance.app", "mode": "managed", "type": "aws_instance",
+             "change": {"actions": ["create"], "after": {"instance_type": "t3.medium", **tags}}},
+            {"address": 'module.app.random_password.datastore["postgres"]', "mode": "managed",
+             "type": "random_password", "change": {"actions": ["create"], "after": {"length": 24}}},
+        ]}
+        self.assertEqual(policy.find_violations(changes, "ec2_compose"), [])
+        self.assertIn("허용하지 않는 리소스 종류 random_password", "\n".join(policy.find_violations(changes, "ec2")))
+
     # ---------- AWS 호출 (가짜 aws CLI) ----------
 
     def test_image_is_pinned_to_digest_and_status_goes_to_dynamodb(self):
@@ -876,6 +1039,8 @@ locals {
 
 AWS_IMAGE = "123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/pawploy-sample:latest"
 GCP_IMAGE = "asia-northeast3-docker.pkg.dev/pawploy-demo/pawploy/pawploy-sample@sha256:" + "b" * 64
+COMPOSE_IMAGES = {"app": "123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/board:latest",
+                  "worker": "123456789012.dkr.ecr.ap-northeast-2.amazonaws.com/board-worker@sha256:" + "c" * 64}
 
 
 if __name__ == "__main__":
