@@ -78,10 +78,12 @@ data "aws_subnets" "default" {
   }
 }
 
-# ---------------- 최신 Amazon Linux 2023 ----------------
+# ---------------- 최신 ECS-optimized Amazon Linux 2023 (Docker·AWS CLI 포함) ----------------
+# 일반 AL2023 은 부팅 때 dnf install docker 로 60~97초를 써서(운영 실측) Docker 가 들어 있는 AMI 를 쓴다.
+# 이 AMI 의 루트 스냅샷은 30GB 라 root_block_device 도 30GB 이상이어야 한다.
 
 data "aws_ssm_parameter" "al2023" {
-  name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+  name = "/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id"
 }
 
 # ---------------- 보안 그룹: 80번 포트만 열기 (SSH 닫음) ----------------
