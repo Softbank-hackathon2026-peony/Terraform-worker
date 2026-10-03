@@ -3,7 +3,7 @@
 AgentCore 가 만든 Terraform 을 받아 **사용자가 승인한 클라우드(AWS·GCP, 하나 또는 둘 다)에 배포하고 접속 주소를 돌려주는** 워커입니다.
 Pawploy 배포 파이프라인의 **21~27단계**를 맡습니다.
 
-- 지원: AWS `ec2`·`lambda`, GCP `cloud_run`. AWS 와 GCP 를 함께 배포할 수 있습니다
+- 지원: AWS `ec2`·`ec2_compose`(컨테이너 여러 개)·`lambda`, GCP `cloud_run`. AWS 와 GCP 를 함께 배포할 수 있습니다
 - 워커는 Terraform 을 만들지 않습니다(AI 없음). 받은 코드를 **검증하고 실행**만 합니다
 - 배포는 최대 60분 뒤 만료되고, 세 겹으로 지웁니다 → [1시간 자동 삭제](#1시간-자동-삭제)
 - Python 표준 라이브러리만 사용합니다. 클라우드 호출은 `terraform`과 `aws` CLI로 합니다
@@ -39,8 +39,8 @@ preparing ─ generating ──────────────────�
 
 | 파일 | 하는 일 |
 |---|---|
-| `tfworker/job.py` | 21단계 입력 검증: 클라우드·아키텍처·이미지 주소(ECR / Artifact Registry digest)·크기·환경변수·TTL |
-| `tfworker/image.py` | AWS: ECR 에 이미지가 있는지 확인하고 태그를 `@sha256:` digest 로 고정 |
+| `tfworker/job.py` | 21단계 입력 검증: 클라우드·아키텍처·이미지 주소(ECR / Artifact Registry digest, `ec2_compose` 는 `images`)·크기·환경변수·TTL |
+| `tfworker/image.py` | AWS: ECR 에 이미지가 있는지 확인하고 태그를 `@sha256:` digest 로 고정 (`images` 는 하나씩 모두) |
 | `tfworker/render.py` | `work/<deploy_id>/<cloud>/` 생성: 모듈 가져오기 + 루트 `main.tf`(provider·필수 태그/label·backend) |
 | `tfworker/iac.py` | **IaC 정적 검사** (plan 전): 금지 문법·허용 리소스·data 소스·파일 읽기·입출력 약속 |
 | `tfworker/terraform.py` | `init → plan → show -json → apply → output → state list` |
@@ -93,7 +93,7 @@ AWS 권한은 실행 환경의 IAM 역할로, GCP 키는 비밀 저장소에서 
 ### 비용 없이 시험하기
 
 ```bash
-python -m unittest -v      # 자동 테스트 27개 (가짜 terraform·aws, 10~30초)
+python -m unittest -v      # 자동 테스트 48개 (가짜 terraform·aws, 20~40초)
 
 # 실제 terraform 으로 문법만 (provider 다운로드만, 클라우드는 부르지 않음)
 terraform -chdir=work/<deploy_id>/<cloud> init -backend=false && terraform -chdir=work/<deploy_id>/<cloud> validate
@@ -137,17 +137,36 @@ terraform -chdir=work/<deploy_id>/<cloud> init -backend=false && terraform -chdi
 | `project_id` | ✅ | 태그·state 경로에 쓰임 |
 | `targets` | ✅ | 승인된 클라우드마다 하나 (최대 AWS 1 + GCP 1) |
 | `targets[].cloud` | ✅ | `aws` / `gcp` |
-| `targets[].architecture` | | **생략 가능.** AgentCore 모듈의 대표 리소스로 워커가 판단(`aws_instance`→`ec2`, `aws_lambda_function`→`lambda`, `google_cloud_run_v2_service`→`cloud_run`). 넘기면 모듈과 다를 때 `generating` 실패. 모듈이 없으면 AWS `ec2`·GCP `cloud_run` 기본 모듈 |
-| `targets[].image_uri` | ✅ | AWS: ECR 주소(태그면 워커가 digest 로 고정). GCP: Artifact Registry 주소 + **`@sha256:` digest 필수** |
+| `targets[].architecture` | | **생략 가능.** AgentCore 모듈의 대표 리소스로 워커가 판단(`aws_instance`→`ec2`, 그중 모듈 폴더에 `compose.yaml.tftpl` 이 있으면 `ec2_compose`, `aws_lambda_function`→`lambda`, `google_cloud_run_v2_service`→`cloud_run`). 넘기면 모듈과 다를 때 `generating` 실패. 모듈이 없으면 AWS `ec2`(`images` 를 넘겼으면 `ec2_compose`)·GCP `cloud_run` 기본 모듈 |
+| `targets[].image_uri` | ✅ | AWS: ECR 주소(태그면 워커가 digest 로 고정). GCP: Artifact Registry 주소 + **`@sha256:` digest 필수**. `ec2_compose` 는 대신 `images` |
+| `targets[].images` | (`ec2_compose`) | 여러 컨테이너 앱: `{이미지 id: ECR 주소}` (아래 [여러 컨테이너](#여러-컨테이너-ec2_compose)). `image_uri` 와 함께 쓸 수 없음. AWS 만 |
 | `targets[].terraform_uri` | | **보통 생략.** 없으면 `PAWPLOY_AGENT_BUCKET` 의 `projects/<project_id>/deploy/<deploy_id>/attempt-<N>/<cloud>/` 중 최신 attempt. 그것도 없으면 기본 모듈(`modules/<architecture>`) |
 | `targets[].region` | | AWS: 생략하면 ECR 주소의 리전(Lambda 는 같아야 함). GCP: 생략하면 Artifact Registry 리전 |
 | `targets[].gcp_project` | | 생략하면 Artifact Registry 주소의 프로젝트 |
-| `container_port`, `size`, `health_path`, `env` | | 기본 8080 / `small`(`micro`·`small`·`medium`) / `/` / `{}`. 모든 클라우드에 같이 적용 |
+| `container_port`, `size`, `health_path`, `env` | | 기본 8080 / `small`(`micro`·`small`·`medium`) / `/` / `{}`. 모든 클라우드에 같이 적용. `ec2_compose` 는 `size`·`health_path` 만 쓴다(포트·환경변수는 `compose.yaml.tftpl` 안에) |
 | `ttl_minutes` | | 5~60, 기본 60 |
 
 - 이미 살아 있는 클라우드를 다시 보내면 거부합니다(종료 코드 2). 재시도는 `failed`·`destroyed` 인 클라우드만 넣습니다.
 - 다른 클라우드가 살아 있는 상태의 재시도는 **처음 만료 시각을 그대로 씁니다** (재시도로 1시간 제한이 늘어나지 않음).
 - `targets` 없이 `architecture`·`image_uri` 를 최상위에 두면 AWS target 하나로 봅니다 (이전 형식, `examples/job-ec2.json`).
+
+### 여러 컨테이너 (`ec2_compose`)
+
+DB·캐시·워커·마이그레이션·nginx 처럼 **컨테이너 여러 개가 같이 떠야 하는 앱**은 EC2 인스턴스 1대에서 Docker Compose 로 실행합니다
+(팀 계약 `2026-10-03-multi-container-contract.md` 4절). 예시: `examples/job-ec2-compose.json`
+
+```json
+{"cloud": "aws", "architecture": "ec2_compose",
+ "images": {"board": "<계정>.dkr.ecr.ap-northeast-2.amazonaws.com/board@sha256:<digest>",
+            "frontend": "<계정>.dkr.ecr.ap-northeast-2.amazonaws.com/frontend:<태그>"},
+ "terraform_uri": "s3://…/aws/"}
+```
+
+- `images` 키 = InfraFit `deploy_units.images[].id` (영문·숫자·`_`·`.`·`-` 1~63자, 영문·숫자로 시작, 최대 10개). 값은 `image_uri` 와 같은 ECR 규칙
+- 모든 이미지의 ECR 리전이 같아야 합니다(배포 리전 기본값). 태그는 워커가 이미지마다 digest 로 고정합니다
+- 빌드하지 않는 레지스트리 이미지(`postgres:16-alpine`, `redis:7-alpine` 등)는 `images` 에 넣지 않고 템플릿에 그대로 적습니다
+- 헬스체크·앱 로그는 `ec2` 와 같습니다 (진입 컨테이너가 연 80번. 최대 대기는 Compose 플러그인·이미지 여러 개·DB 준비 때문에 900초 / 실패 시 EC2 콘솔 출력에 `docker compose ps`·로그 끝부분이 함께 남음)
+- 크기: 허용 인스턴스 타입은 그대로(`t3.micro`·`small`·`medium`). 컨테이너가 여럿이면 메모리가 모자라기 쉬우므로 **`medium`(4GB) 권장**
 
 ### AgentCore 가 만들 Terraform 모듈 (18~19단계) — AgentCore 담당과 맞출 약속
 
@@ -159,6 +178,31 @@ terraform -chdir=work/<deploy_id>/<cloud> init -backend=false && terraform -chdi
 - 출력: `endpoint`, `health_url`, `resource_id`
 - 리소스는 `var.name` 으로 시작하는 이름 (IAM `name_prefix` 는 `substr(var.name, 0, 37)`)
 
+#### `ec2_compose` 모듈 약속
+
+`modules/ec2_compose` 를 그대로 쓰고 **`compose.yaml.tftpl` 만 앱마다 바꿔 넣는 것**을 전제로 합니다 (AgentCore 코드가 `deploy_units` 로 렌더, LLM 아님).
+모듈 폴더에 `compose.yaml.tftpl` 이 있어야 워커가 `ec2_compose` 로 판단합니다.
+
+| 구분 | 내용 |
+|---|---|
+| 입력 변수 | `name`(string), `images`(map(string): 이미지 id → digest 고정 ECR 주소), `size`(string), `health_path`(string). `image_uri`·`container_port`·`env` 는 넘기지 않음 |
+| 출력 | `endpoint`, `health_url`, `resource_id` (다른 아키텍처와 같음) |
+| 추가로 허용 | `random_password` 리소스, provider source `hashicorp/random` (버전은 워커 루트가 `~> 3.6` 으로 고정) |
+| 그 밖 | `modules/ec2` 와 같은 보안: 기본 VPC, 인바운드 80번만, ECR 읽기 권한만, IMDSv2(홉 1: 컨테이너에서 인스턴스 역할 사용 불가), 디스크 암호화(30GB), CPU 크레딧 standard |
+
+`compose.yaml.tftpl` 템플릿 약속 (모듈이 `templatefile()` 로 렌더해 user_data 로 넘기고, 인스턴스가 `/opt/pawploy/compose.yaml` 로 저장 → `docker compose up -d`):
+
+| 템플릿 값 | 형식 | 쓰는 법 |
+|---|---|---|
+| `images` | map(string), 키 = 작업 입력 `targets[].images` 의 키 | `image: "${images["board"]}"`. 템플릿이 쓰는 id 가 입력에 없으면 IaC 검사(`generating`)에서 거부. 입력에만 있는 id 는 경고만 |
+| `passwords` | map(string), 키 = 템플릿에 적힌 `passwords["<id>"]` 의 id | `POSTGRES_PASSWORD: "${passwords["postgres"]}"`, `DATABASE_URL: "postgresql://app:${passwords["postgres"]}@postgres:5432/app"`. 모듈이 id 마다 `random_password`(영문·숫자 24자, 특수문자 없음)를 하나 만들고, 같은 id 는 어디에 쓰든 같은 값. id 는 `[A-Za-z0-9_.-]+`, 반드시 `passwords["id"]` 모양으로 (점 표기 `passwords.id` 는 찾지 못해 plan 오류). 관례상 id = `deploy_units.datastores[].id` |
+
+- 진입(`entry`) 컨테이너만 호스트 포트를 엽니다: `ports: ["80:<entry.port>"]`. 다른 호스트 포트는 열지 않습니다(보안 그룹도 80 만 허용)
+- 서비스 이름은 `deploy_units` 의 `id` 그대로 (컨테이너끼리 이 이름으로 접속). compose 프로젝트 이름은 `app`
+- 템플릿 문법과 겹치는 글자: 값에 글자 그대로 `${` 가 있으면 `$${`, `%{` 는 `%%{` 로 적습니다 (compose 변수 `${VAR}` 도 마찬가지)
+- 쓰지 않는 것 (워커가 거부): `build`, `privileged: true`, `network_mode`/`pid`/`ipc`/`userns_mode: host`, `docker.sock` 마운트, `cap_add`, `devices`, 템플릿 안의 `file()`·`templatefile()` 등 파일 읽기 함수
+- 컨테이너 로그는 Docker 기본 설정으로 10MB × 3개까지만 남깁니다 (인스턴스의 `/etc/docker/daemon.json`)
+
 워커가 거부하는 것 (`iac.py`, plan 전):
 
 | 금지 | 이유 |
@@ -166,12 +210,13 @@ terraform -chdir=work/<deploy_id>/<cloud> init -backend=false && terraform -chdi
 | `provider`·`backend`·`cloud`·`module` 블록, `default_tags`·`default_labels` | 워커가 정한 계정·state·필수 태그를 바꿀 수 있음 |
 | `provisioner`, `local-exec`/`remote-exec`, `data "external"` 등 허용 목록 밖 data 소스 | plan·apply 때 워커 컴퓨터에서 명령 실행, 팀 비밀값(SSM·Secrets Manager) 읽기 |
 | `aws_ssm_parameter` 중 `/aws/service/...` 가 아닌 것, `access_token` | 팀 비밀값·워커 GCP 토큰을 앱 환경변수로 흘릴 수 있음 |
-| `file()`·`templatefile()` 의 경로가 `"${path.module}/..."` 가 아닌 것 | 워커 컴퓨터의 자격 증명 파일을 읽어 앱으로 넘길 수 있음 |
-| 허용 목록 밖 리소스 (`policy.ALLOWED_TYPES`), 허용 밖 IAM 정책·인라인 정책 | 우리 계정 권한 탈취·비용 |
+| `file()`·`templatefile()` 의 경로가 `"${path.module}/..."` 가 아닌 것, `.tftpl` 안의 파일 읽기 함수 | 워커 컴퓨터의 자격 증명 파일을 읽어 앱으로 넘길 수 있음 |
+| `compose.yaml.tftpl` 의 `privileged`·host 네트워크·`docker.sock`·`cap_add`·`devices`·`build`, 입력에 없는 `images["id"]` | 컨테이너가 인스턴스 권한을 가져감 / 빌드는 CodeBuild 에서 끝냄 / plan 에서 알기 어려운 오류 |
+| 허용 목록 밖 리소스 (`policy.ALLOWED_TYPES`, `random_password` 는 `ec2_compose` 만), 허용 밖 IAM 정책·인라인 정책 | 우리 계정 권한 탈취·비용 |
 | `iam_instance_profile`·`role`·`service_account` 에 문자열 직접 쓰기 (예외: `roles/run.invoker`) | 계정에 이미 있는 관리자 역할·GCP 기본 계정(편집자)을 앱에 붙일 수 있음 |
-| EC2 `cpu_credits` 가 `standard` 가 아님, Cloud Run `deletion_protection` 이 `false` 가 아님 | 추가 과금 / 1시간 뒤 destroy 실패 |
+| EC2·`ec2_compose` `cpu_credits` 가 `standard` 가 아님, Cloud Run `deletion_protection` 이 `false` 가 아님 | 추가 과금 / 1시간 뒤 destroy 실패 |
 
-plan 결과는 apply 전에 `policy.py` 가 한 번 더 검사합니다(앱 권한은 이 배포에서 새로 만든 역할·프로필·서비스 계정만, Cloud Run 은 서비스 계정 지정 필수, 만료 예약은 워커 루트에서만, 인스턴스 타입, Lambda 메모리·타임아웃, 인바운드 80번만, Cloud Run 메모리 2Gi·인스턴스 1개 이하, 공개 호출 권한은 `roles/run.invoker → allUsers` 만, 필수 태그/label).
+plan 결과는 apply 전에 `policy.py` 가 한 번 더 검사합니다(리소스 종류는 아키텍처별 허용 목록, 앱 권한은 이 배포에서 새로 만든 역할·프로필·서비스 계정만, Cloud Run 은 서비스 계정 지정 필수, 만료 예약은 워커 루트에서만, 인스턴스 타입, Lambda 메모리·타임아웃, 인바운드 80번만, Cloud Run 메모리 2Gi·인스턴스 1개 이하, 공개 호출 권한은 `roles/run.invoker → allUsers` 만, 필수 태그/label).
 
 ## 결과 형식 (22·27단계: Worker → Main Server)
 
@@ -211,6 +256,7 @@ plan 결과는 apply 전에 `policy.py` 가 한 번 더 검사합니다(앱 권�
 | `failed_stage` | 22단계 "실패 단계". 위 상태 이름 중 하나 (`generating` 이면 IaC 검사 위반, `plan` 이면 정책 위반도 포함) |
 | `error`, `log_tail` | 22단계 "오류 로그". AgentCore 에 수정을 맡길 때 그대로 넘기면 됨 |
 | `app_log` | 응답 없음(`health_check`)일 때 지우기 전에 모은 앱 로그 (EC2·Lambda) |
+| `image_uri` / `images` | 실제로 배포한 이미지 (digest 고정). `ec2_compose` 는 `images`(이미지 id → 주소) |
 | `current_state` | 22단계 "현재 상태". 정리 뒤 state 에 남은 리소스 주소. 정상이면 `[]` |
 | `destroyed` | 실패 뒤 정리(destroy)를 했는지. apply 전 실패는 만든 게 없어 `false` |
 
@@ -254,7 +300,7 @@ GCP 배포에는 **서비스 계정 키**가 필요합니다. 서비스 계정 �
 | `GOOGLE_APPLICATION_CREDENTIALS` | GCP 서비스 계정 키 파일 경로 |
 | `PAWPLOY_WORK_DIR` | 작업 폴더 위치 (기본 `./work`) |
 | `PAWPLOY_OFFLINE` | `1`이면 AWS 호출 단계를 건너뜀 (시험용) |
-| `PAWPLOY_HEALTH_TIMEOUT`, `PAWPLOY_HEALTH_INTERVAL` | 헬스체크 최대 대기·간격(초). 기본 EC2 420 / Lambda·Cloud Run 180, 간격 10 |
+| `PAWPLOY_HEALTH_TIMEOUT`, `PAWPLOY_HEALTH_INTERVAL` | 헬스체크 최대 대기·간격(초). 기본 EC2 420 / ec2_compose 900 / Lambda·Cloud Run 180, 간격 10 |
 | `TERRAFORM_BIN`, `AWS_BIN` | 실행 파일 경로 |
 
 **동시 실행 방지**: `PAWPLOY_STATUS_TABLE` 이 있으면 deploy·destroy 는 `deploy_id` 단위 잠금(같은 테이블의 `lock#<deploy_id>` 항목, 조건부 쓰기)을 잡고,
@@ -294,9 +340,10 @@ bash infra/setup-aws.sh --apply    # 실제로 생성 → 마지막에 워커 �
 tfworker/          워커 (위 표 참고) + awscli.py(aws CLI 실행 도우미)
 modules/           기본 모듈 = AgentCore 가 고칠 베이스 (terraform_uri 가 없으면 그대로 사용)
   ec2/             Amazon Linux 2023 + Docker. 기본 VPC, 80번 포트만, ECR 읽기 권한만
+  ec2_compose/     ec2 와 같은 인스턴스 + Docker Compose 로 컨테이너 여러 개. compose.yaml.tftpl(예시)·random_password
   lambda/          이미지 Lambda + 인증 없는 함수 URL, 로그 쓰기 권한만
   cloud_run/       Cloud Run v2 + 권한 없는 앱 전용 서비스 계정 + 공개 호출, 인스턴스 최대 1개
-examples/          작업 입력 예시 (job-ec2 / job-gcp / job-multi), 테스트용 sample-app
+examples/          작업 입력 예시 (job-ec2 / job-ec2-compose / job-gcp / job-multi), 테스트용 sample-app
 tools/             fake-terraform.py, fake-aws.py (테스트용), push-sample-image.sh
 infra/setup-aws.sh 운영 인프라(S3·DynamoDB·SQS·Scheduler 역할) 생성 스크립트
 Dockerfile         워커 실행 이미지
@@ -312,6 +359,8 @@ work/<deploy_id>/  배포마다 생기는 작업 폴더 (git 제외): result.jso
 |---|---|
 | 가짜 terraform·aws 로 36개 경로 (+ 기존 역할·계정 재사용 차단, S3 작업 입력, maintenance) (+ 입력 오류 기록, DynamoDB 잠금·결과 이어받기, 만료 큐 처리): 단일·멀티 클라우드, 한쪽 실패 후 그쪽만 재시도, 단계별 실패 보고·정리, AgentCore 모듈 사용·IaC 거부·정책 거부, 입력 오류, sweep·orphans 등 | ✅ |
 | 실제 terraform `validate` (EC2·Lambda·Cloud Run 루트+모듈) + `fmt` | ✅ (AWS provider 6.67, Google provider 6.50) |
+| `ec2_compose`: 가짜 terraform·aws 로 배포·삭제·digest 고정·아키텍처 판단·입력/IaC/정책 거부 + 실제 terraform `validate`·`fmt`(루트+모듈, random provider) + 예시 템플릿 렌더 결과 `docker compose config` | ✅ 2026-10-03 |
+| 실제 AWS `ec2_compose` 한 바퀴 | ❌ |
 | 실제 AWS EC2 한 바퀴 (배포 → 접속 → 삭제) | ✅ 2026-10-02 (`targets` 구조로 재확인: 헬스체크 121초, 삭제 후 남은 리소스 없음) |
 | 실제 GCP Cloud Run 한 바퀴 (배포 → 접속 → 삭제) | ✅ 2026-10-02 (`softbankhackathon2026-peony`, 첫 시도 403 → 실패 보고·정리 → 권한 추가 후 같은 deploy_id 재시도 성공) |
 | 실제 AWS·GCP 동시 배포, S3·DynamoDB·Scheduler 실제 호출 | ❌ |

@@ -11,7 +11,7 @@
 
 Terraform 은 AgentCore 가 만들어 S3 에 둔다(18~19단계). 워커는 사용자가 승인한 클라우드(target)마다
 AI 없이 항상 같은 순서로 검증하고 실행한다.
-  preparing    ECR 이미지 확인·digest 고정 (AWS)                           image.py
+  preparing    ECR 이미지 확인·digest 고정 (AWS, images 는 하나씩)         image.py
   generating   모듈 가져오기 + 루트 main.tf(provider·태그·backend)          render.py
                IaC 정적 검사                                               iac.py
   init → plan → 정책 검사(policy.py) → S3 보관(artifacts.py) → apply → health_check(26) → running(27)
@@ -34,7 +34,8 @@ from pathlib import Path
 from . import artifacts, awscli, diagnose, expire, health, iac, image, policy, recommendation, store
 from . import job as jobmod, render, terraform as tf
 
-HEALTH_TIMEOUT = {"ec2": 420, "lambda": 180, "cloud_run": 180}   # EC2는 부팅 + Docker 설치 시간이 필요
+# EC2는 부팅 + Docker 설치 시간이 필요. ec2_compose 는 Compose 플러그인 내려받기 + 이미지 여러 개 pull + DB 헬스 대기까지
+HEALTH_TIMEOUT = {"ec2": 420, "ec2_compose": 900, "lambda": 180, "cloud_run": 180}
 IN_PROGRESS = {"preparing", "generating", "init", "plan", "apply", "health_check"}
 # 리소스가 남아 있지 않은 클라우드 상태: 같은 deploy_id 로 그 클라우드를 다시 배포할 수 있다
 REUSABLE_TARGET_STATUSES = {None, "failed", "destroyed"}
@@ -234,10 +235,13 @@ def deploy_target(job: dict, tjob: dict) -> str:
 
     try:
         if cloud == "aws" and not awscli.offline():
-            tjob["image_uri"] = image.resolve(tjob["image_uri"])
+            if tjob.get("images"):   # ec2_compose: 이미지마다 digest 고정
+                tjob["images"] = {k: image.resolve(v) for k, v in tjob["images"].items()}
+            else:
+                tjob["image_uri"] = image.resolve(tjob["image_uri"])
         step("generating")
         wd = render.render(tjob)
-        iac.check(wd / "modules" / "app", cloud, tjob["architecture"])
+        iac.check(wd / "modules" / "app", cloud, tjob["architecture"], tjob.get("images"))
 
         step("init", terraform_source=tjob["terraform_source"], architecture=tjob["architecture"])   # 어느 attempt 의 코드인지 (22단계 보고에 필요)
         tf.run(wd, "init", "-upgrade", *render.backend_args(tjob))
@@ -256,8 +260,9 @@ def deploy_target(job: dict, tjob: dict) -> str:
         out = tf.run(wd, "output", "-json", capture_json=True)
         resource_id = out["resource_id"]["value"]
         health_url = out["health_url"]["value"]
+        images = {"images": tjob["images"]} if tjob.get("images") else {"image_uri": tjob["image_uri"]}
         step("health_check", endpoint=out["endpoint"]["value"], health_url=health_url,
-             resource_id=resource_id, image_uri=tjob["image_uri"])
+             resource_id=resource_id, **images)
 
         timeout = int(os.environ.get("PAWPLOY_HEALTH_TIMEOUT") or HEALTH_TIMEOUT[tjob["architecture"]])
         interval = int(os.environ.get("PAWPLOY_HEALTH_INTERVAL") or 10)

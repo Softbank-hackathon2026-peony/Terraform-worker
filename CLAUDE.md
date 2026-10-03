@@ -41,7 +41,7 @@ claude.ai에서 나눈 설계 대화를 정리한 컨텍스트입니다. 작업 
 
 - **배포는 우리 팀 계정에 한다.** 사용자 계정 배포 아님
 - **악용 방지를 위해 1시간 타임아웃** 후 자동 삭제. 사용자가 직접 종료도 가능
-- 배포 대상: AWS EC2·Lambda (ECS Fargate 예정), GCP Cloud Run. SageMaker 는 범위 밖
+- 배포 대상: AWS EC2·EC2 Compose(컨테이너 여러 개)·Lambda (ECS Fargate 예정), GCP Cloud Run. SageMaker 는 범위 밖
 - GCP 이미지는 **CodeBuild 가 ECR 과 Artifact Registry 양쪽에 푸시**하고 digest 를 넘긴다
 - AWS·GCP 동시 배포 중 **한쪽만 실패하면 성공한 쪽은 유지**하고, 실패한 클라우드만 재시도
 
@@ -59,8 +59,9 @@ claude.ai에서 나눈 설계 대화를 정리한 컨텍스트입니다. 작업 
 - 실행 전 **IaC 정적 검사**(`iac.py`) + apply 전 **plan 정책 검사**(`policy.py`). 이 두 검사가 사용자 코드에서 온 프롬프트 인젝션에 대한 실제 방어선
 - **실패하면 어느 단계든 만든 리소스를 지운 뒤 보고**한다 → 수정본 재요청(23~25 → 21)은 항상 빈 상태에서 시작. 정책의 "배포 중 삭제 금지"와도 충돌하지 않음
 - 워커가 AgentCore 를 직접 부르지 않는다. 실패 보고(22)를 Main Server 가 AgentCore 에 넘긴다
-- `modules/ec2`·`lambda`·`cloud_run` 은 **AgentCore 가 고칠 베이스**이자 `terraform_uri` 가 없을 때 쓰는 기본값
+- `modules/ec2`·`ec2_compose`·`lambda`·`cloud_run` 은 **AgentCore 가 고칠 베이스**이자 `terraform_uri` 가 없을 때 쓰는 기본값
 - **모든 모듈은 같은 입력, 같은 출력**: 입력 `name`, `image_uri`, `container_port`, `size`, `env`, `health_path` / 출력 `endpoint`, `health_url`, `resource_id`
+  예외 `ec2_compose`(여러 컨테이너): 입력 `name`, `images`(map), `size`, `health_path` + 모듈 안의 `compose.yaml.tftpl`. 출력은 같음
 - **클라우드마다 작업 폴더·state 를 따로** 둔다(`work/<deploy_id>/<cloud>/`). 모듈까지 복사해 두므로 1시간 뒤 destroy 때 같은 코드로 정확히 지움
 - 필수 태그: AWS `pawploy:managed`·`pawploy:project_id`·`pawploy:deploy_id`·`pawploy:expires_at` / GCP label 은 `:` 를 못 써서 `pawploy-managed` 등 하이픈 이름
 
@@ -80,6 +81,7 @@ claude.ai에서 나눈 설계 대화를 정리한 컨텍스트입니다. 작업 
 - **AgentCore 모듈 위치 (2026-10-02 AgentCore 담당과 확인)**: 버킷 `pawploy-agent-<계정>`, `projects/<project_id>/deploy/<deploy_id>/attempt-<N>/main.tf`. `terraform_uri` 가 없으면 워커가 `PAWPLOY_AGENT_BUCKET` 에서 **N 이 가장 큰 attempt** 를 고른다(숫자 비교, `attempt-N/<cloud>/` 가 있으면 그 폴더, 없으면 기본 모듈). 쓴 위치는 `targets.<cloud>.terraform_source` 로 결과·실패 보고에 남김
 - **멀티 클라우드 (2026-10-03 AgentCore 와 확정)**: AgentCore 가 한 번에 `attempt-N/aws/main.tf`·`attempt-N/gcp/main.tf` 를 만들고, 한쪽만 고쳐도 새 attempt 에 두 클라우드를 다 둔다. Main 은 배포할 **클라우드만** 고른다(`targets[].cloud` + `image_uri`, `architecture` 생략). 워커가 모듈의 대표 리소스로 아키텍처를 판단(입력과 다르면 generating 실패). AgentCore 실제 예시 `dep-demo-2` attempt-2 로 S3 최신 attempt 선택 → 아키텍처 판단(aws=lambda, gcp=cloud_run) → IaC → 실제 plan → 정책 검사 통과 (apply 안 함)
 - `targets` 없이 `architecture`·`image_uri` 를 최상위에 두면 AWS 하나 (이전 형식, `examples/job-ec2.json`)
+- **여러 컨테이너 (2026-10-03, 팀 계약 `2026-10-03-multi-container-contract.md` 4절)**: AWS target 에 `image_uri` 대신 `images: {이미지 id: ECR 주소}` → `ec2_compose`(EC2 1대 + Docker Compose). 이미지마다 ECR 검사·digest 고정, 리전은 모두 같아야 함. 아키텍처 판단: `aws_instance` 모듈에 `compose.yaml.tftpl` 이 있으면 `ec2_compose`. 이미지 입력 모양(images/image_uri)과 모듈 아키텍처가 다르면 generating 실패. 템플릿 약속(`images`·`passwords` 값, 80번 진입, 금지 설정)은 README "ec2_compose 모듈 약속". 루트 main.tf 에 `hashicorp/random ~> 3.6` 을 이 아키텍처일 때만 추가 (컨테이너 1개 아키텍처의 루트는 그대로)
 - GCP 이미지는 digest 필수(워커에 gcloud 없음). GCP 프로젝트·리전은 Artifact Registry 주소에서 추출
 - 살아 있는 클라우드를 다시 보내면 거부(종료 코드 2). 재시도는 `failed`·`destroyed` 클라우드만, 만료 시각은 처음 것 유지
 
@@ -107,7 +109,7 @@ tfworker/
   terraform.py       terraform CLI 실행 (로그 실시간 출력, json / text 캡처)
   policy.py          plan(show -json) 검사: 리소스 종류·EC2 타입·크레딧·Lambda 크기·인바운드 80·IAM·Cloud Run 메모리/인스턴스/권한/삭제 보호·필수 태그/label
   artifacts.py       검사를 통과한 작업 폴더를 S3(PAWPLOY_ARTIFACT_BUCKET)에 보관, destroy 때 복원
-  health.py          헬스체크 (EC2 420초, Lambda·Cloud Run 180초)
+  health.py          헬스체크 (EC2 420초, ec2_compose 900초, Lambda·Cloud Run 180초)
   diagnose.py        응답 없음일 때 지우기 전 앱 로그 수집 (EC2 콘솔 / Lambda 로그. Cloud Run 은 아직)
   store.py           result.json 을 DynamoDB(PAWPLOY_STATUS_TABLE)에도 기록. 실패해도 배포는 계속
   expire.py          sweep(로컬+DynamoDB 에서 만료 배포 찾아 destroy), orphans(AWS 태그로 남은 리소스 알림)
@@ -125,17 +127,20 @@ tfworker/consume.py  작업 큐 소비자: {action:deploy, job_uri:s3://...} / {
 modules/
   ec2/            Amazon Linux 2023 + Docker. 기본 VPC, 80번 포트만, ECR 읽기 권한, IMDSv2, 디스크 암호화, CPU 크레딧 standard
     user_data.sh.tftpl   부팅 시 Docker 설치 → ECR 로그인 → 이미지 실행 (-p 80:<container_port>)
+  ec2_compose/    ec2 와 같은 보안 + IMDS 홉 1·디스크 30GB. random_password(템플릿의 passwords["id"] 마다 하나)
+    user_data.sh.tftpl   Docker + Compose 플러그인(v2.39.4, 체크섬 고정) → 레지스트리별 ECR 로그인 → compose.yaml → pull → up -d → 상태·로그를 콘솔에
+    compose.yaml.tftpl   예시 (app + postgres + redis). 실제로는 AgentCore 코드가 deploy_units 로 렌더해 넣음
   lambda/         이미지 Lambda + 인증 없는 함수 URL(InvokeFunctionUrl + InvokeFunction), 로그 쓰기 권한만
   cloud_run/      Cloud Run v2 + 권한 없는 앱 전용 서비스 계정 + allUsers 호출, 인스턴스 최대 1, deletion_protection=false
 examples/
-  job-ec2.json, job-lambda.json (이전 형식), job-gcp.json, job-multi.json (targets 형식). image_uri 는 실제 값으로 바꿔 work/ 에 복사해 쓸 것
+  job-ec2.json, job-lambda.json (이전 형식), job-gcp.json, job-multi.json, job-ec2-compose.json (targets 형식). image_uri 는 실제 값으로 바꿔 work/ 에 복사해 쓸 것
   sample-app/     테스트용 이미지 (Python 웹앱 + Lambda Web Adapter 1.1.0, EC2·Lambda·Cloud Run 겸용, PORT 환경변수 사용)
 tools/
   fake-terraform.py     가짜 terraform (FAKE_TF_FAIL, FAKE_TF_FAIL_CLOUD, FAKE_TF_ENDPOINT, FAKE_TF_INSTANCE_TYPE, FAKE_TF_EXTRA_RESOURCE, state list)
   fake-aws.py           가짜 aws CLI (FAKE_AWS_LOG 에 호출 기록, ECR·DynamoDB·S3·태그 조회 응답 흉내)
   push-sample-image.sh  샘플 이미지 linux/amd64 빌드 → ECR 푸시 (--provenance=false 필수, Lambda 가 이미지 인덱스를 거부)
 tests/
-  test_worker.py     unittest 42개. `python -m unittest -v` (비용 없음, 1분 안팎)
+  test_worker.py     unittest 49개. `python -m unittest -v` (비용 없음, 1~2분)
 ```
 
 - S3 backend 는 `use_lockfile=true`로 잠금 → Terraform **1.10 이상**. key 는 `deployments/<project_id>/<deploy_id>/<cloud>.tfstate` (GCP state 도 S3)
@@ -165,7 +170,8 @@ python -m tfworker orphans
 - **SQS + Fargate 워커 가동 (2026-10-02, 이미지 6b2389e)**: 서비스 실행, maintenance(만료 큐·DynamoDB scan) 동작, S3 작업 JSON → 큐 메시지 → 입력 오류 거부 → DynamoDB `status=rejected` → 메시지 삭제·작업 보호 켜고 끄기 확인 (`dep-queue-test`)
 - **Fargate 워커로 실제 배포 + 1시간 자동 삭제 (2026-10-02~03)**: `dep-fargate-ec2`(Excalidraw EC2) 큐 메시지 → running(273초) → 만료 시각 Scheduler → 만료 큐 → 워커 destroy(약 50초 뒤 시작, 2분 만에 destroyed), 남은 리소스·예약 없음
 - **실제 파이프라인 산출물로 AWS+GCP 동시 배포 성공 (`dep-test-1`, prj_test)**: AgentCore 분석값 + CodeBuild(pawploy-build) 이미지(ECR `pawploy-apps@sha256:757c…`, AR `pawploy/pawploy-apps@sha256:c0d7…`) + AgentCore `attempt-1/{aws,gcp}` → Fargate 워커가 최신 attempt 자동 선택 → **Lambda running(116초)**, **Cloud Run running(68초)**, 두 주소 모두 HTTP 200 (Lambda 첫 실제 배포)
-- **아직 확인 안 된 것**: 실패 → AgentCore fix_terraform → attempt-2 재시도 한 바퀴, 3d612ae(아키텍처 자동 판단) Fargate 반영
+- **ec2_compose (2026-10-03)**: 가짜 terraform·aws 로 배포·삭제, 이미지마다 digest 고정, 모듈로 아키텍처 판단·이미지 입력 모양 불일치 보고, 입력 오류 9종, IaC(템플릿 파일 읽기·compose 호스트 권한·입력에 없는 이미지 id)·정책(random_password 는 ec2_compose 만) 확인. 실제 terraform `validate`·`fmt` 통과(루트+모듈, random provider), 예시 템플릿 렌더 결과 `docker compose config` 통과. 컨테이너 1개 아키텍처의 렌더 결과(main.tf·tfvars)는 이전과 바이트 단위로 같음
+- **아직 확인 안 된 것**: 실패 → AgentCore fix_terraform → attempt-2 재시도 한 바퀴, 3d612ae(아키텍처 자동 판단) Fargate 반영, 실제 AWS ec2_compose 한 바퀴(plan·apply)
 - 해결된 의심 지점
   - `modules/lambda`: 인증 없는 함수 URL은 `lambda:InvokeFunctionUrl` + `lambda:InvokeFunction`(`invoked_via_function_url`) 둘 다 필요
   - `modules/ec2` 기본 VPC: 인터넷 게이트웨이가 지워져 경로가 `blackhole`이었음 → `default-vpc-igw` 연결로 해결. EC2 헬스체크가 `URLError`만 반복하면 이것부터 확인
@@ -188,10 +194,11 @@ python -m tfworker orphans
    - [x] 워커 실행 역할 최소 권한(`ppw-worker-task`), GCP 키 Secrets Manager, Fargate 서비스 가동
 7. [x] (2026-10-02 setup_fargate.py --apply) 팀 계정에 S3·상태 테이블·destroy 큐·Scheduler 역할 만들기 (`infra/setup-aws.sh --apply`, 사용자 확인 후) + `sweep`·`drain-destroy-queue` 를 5~10분 주기로 돌릴 자리
 8. [ ] GCP label 기반 남은 리소스 감시 (`orphans` 의 GCP 판), Cloud Run 앱 로그 수집
-9. [ ] ECS Fargate 모듈 (공용 ALB + 배포별 대상 그룹·리스너 규칙). 추가 시 `job.CLOUD_ARCHITECTURES`·`policy.ALLOWED_TYPES` 에도 등록
-10. [ ] **실패 → 22단계 보고 → AgentCore `fix_terraform` → attempt-2 재배포 실제 한 바퀴** ← 다음 최우선 (AgentCore 담당과 함께)
-11. [ ] CodeBuild 역할 `pawploy-codebuild` 가 워커 IAM 범위 `role/pawploy-*` 에 걸림 → `ppw-codebuild` 로 이름 변경 또는 워커 정책에 Deny (Build Worker 담당과 협의)
-12. [ ] AWS Budgets·GCP 예산 알림 (지금 계정에 예산 없음), ALB 가 CloudFront 경유 요청만 받는지 확인 (Main 담당)
+9. [ ] 실제 AWS `ec2_compose` 한 바퀴 (`examples/job-ec2-compose.json`, size medium). 헬스체크 기본 900초로 충분한지 실제 부팅 시간 확인
+10. [ ] ECS Fargate 모듈 (공용 ALB + 배포별 대상 그룹·리스너 규칙). 추가 시 `job.CLOUD_ARCHITECTURES`·`policy.ALLOWED_TYPES` 에도 등록
+11. [ ] **실패 → 22단계 보고 → AgentCore `fix_terraform` → attempt-2 재배포 실제 한 바퀴** ← 다음 최우선 (AgentCore 담당과 함께)
+12. [ ] CodeBuild 역할 `pawploy-codebuild` 가 워커 IAM 범위 `role/pawploy-*` 에 걸림 → `ppw-codebuild` 로 이름 변경 또는 워커 정책에 Deny (Build Worker 담당과 협의)
+13. [ ] AWS Budgets·GCP 예산 알림 (지금 계정에 예산 없음), ALB 가 CloudFront 경유 요청만 받는지 확인 (Main 담당)
 
 ### 기타 산출물
 - PR #3 (`feat/multi-cloud-a-plan` → `main`) 머지됨 (2026-10-03)
@@ -211,6 +218,6 @@ python -m tfworker orphans
 
 ## 6. 팀원과 맞춰야 할 약속
 
-- **AgentCore 담당**: 클라우드별 Terraform 모듈 형식(입력 6개·출력 3개, provider·backend 금지, 금지 문법 목록), S3 저장 경로, 아키텍처 이름 `ec2`/`lambda`/`cloud_run`(/`ecs_fargate`)
+- **AgentCore 담당**: 클라우드별 Terraform 모듈 형식(입력 6개·출력 3개, provider·backend 금지, 금지 문법 목록), S3 저장 경로, 아키텍처 이름 `ec2`/`ec2_compose`/`lambda`/`cloud_run`(/`ecs_fargate`), `ec2_compose` 의 `compose.yaml.tftpl` 템플릿 약속(README)
 - **Build Worker 담당**: ECR + (GCP 선택 시) Artifact Registry 푸시, digest(`@sha256:`) 전달, `linux/amd64`, **Lambda용 이미지에 Lambda Web Adapter 포함**, 앱은 `PORT` 환경변수로 포트를 받기
 - **Main Server 담당**: 21단계 입력 형식(`targets`), 호출 방식, 결과(`result.json` / DynamoDB) 읽는 법, 22단계 보고를 AgentCore 에 넘기는 방식, 재시도 시 실패한 클라우드만 보내기, 사용자 종료 요청

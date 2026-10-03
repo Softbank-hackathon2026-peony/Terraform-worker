@@ -7,17 +7,23 @@ plan 결과는 apply 직전에 policy.py 가 한 번 더 검사한다.
 모듈 약속 (AgentCore 와 맞출 것)
   - 폴더 하나에 .tf / .tftpl 파일만. provider·backend 는 쓰지 않는다 (워커가 루트에서 정함)
   - 입력 변수: name, image_uri, container_port, size, env, health_path
+    (ec2_compose: name, images, size, health_path + 모듈 안의 compose.yaml.tftpl)
   - 출력: endpoint, health_url, resource_id
 """
 import re
 from pathlib import Path
 
 from . import policy
+from .render import COMPOSE_TEMPLATE
 
 ALLOWED_SUFFIXES = {".tf", ".tftpl"}
 CONTRACT_VARIABLES = ("name", "image_uri", "container_port", "size", "env", "health_path")
+# 여러 컨테이너: 이미지 id → 주소 map 하나. 포트·환경변수·비밀번호는 compose.yaml.tftpl 안에서 정한다
+COMPOSE_CONTRACT_VARIABLES = ("name", "images", "size", "health_path")
 CONTRACT_OUTPUTS = ("endpoint", "health_url", "resource_id")
-PROVIDER_SOURCES = {"aws": "hashicorp/aws", "gcp": "hashicorp/google"}
+PROVIDER_SOURCES = {"aws": {"hashicorp/aws"}, "gcp": {"hashicorp/google"}}
+# ec2_compose 는 데이터 저장소 비밀번호(random_password)를 위해 hashicorp/random 도 쓴다 (버전은 워커 루트에서 고정)
+ARCHITECTURE_PROVIDER_SOURCES = {"ec2_compose": {"hashicorp/random"}}
 
 # plan·apply 때 임의 코드를 실행하거나, 루트에서 고정한 provider·backend·태그를 우회하는 문법
 FORBIDDEN = [
@@ -37,6 +43,19 @@ ALLOWED_DATA = {
     "gcp": {"google_client_config"},
 }
 FILE_FUNC_RE = re.compile(r"\b(file\w*|templatefile)\s*\(\s*([^,)]*)")
+# 템플릿(.tftpl) 안에서도 함수를 부를 수 있다. 템플릿에는 path.module 이 없으므로 파일 읽기 함수는 모두 금지
+TEMPLATE_FILE_FUNC_RE = re.compile(
+    r"\b(file|filebase64|filebase64sha\d+|fileexists|filemd5|filesha\d+|fileset|templatefile)\s*\(")
+IMAGE_REF_RE = re.compile(r'\bimages\["([A-Za-z0-9_.-]+)"\]')
+# compose 컨테이너가 인스턴스(호스트) 권한을 갖게 하는 설정. 메타데이터(IMDS)·Docker 소켓으로 인스턴스 역할을 가져갈 수 있다
+COMPOSE_FORBIDDEN = [
+    (r"\bprivileged\s*:\s*['\"]?true", "privileged: true"),
+    (r"\b(network_mode|pid|ipc|userns_mode)\s*:\s*['\"]?host\b", "network_mode/pid/ipc: host"),
+    (r"docker\.sock", "Docker 소켓 마운트"),
+    (r"\bcap_add\s*:", "cap_add"),
+    (r"\bdevices\s*:", "devices"),
+    (r"(?m)^\s*build\s*:", "build (이미지는 미리 빌드해 images 로 넘김)"),
+]
 MODULE_PATH_ARG_RE = re.compile(r'^"\$\{path\.module\}/[^"]+"$')
 SSM_BLOCK_RE = re.compile(r'data\s+"aws_ssm_parameter"\s+"[\w-]+"\s*\{(.*?)\n\}', re.DOTALL)
 
@@ -47,14 +66,14 @@ class IacError(ValueError):
         super().__init__("IaC 검사 위반:\n  - " + "\n  - ".join(violations))
 
 
-def check(module_dir: Path, cloud: str, architecture: str) -> None:
-    violations = find_violations(module_dir, cloud, architecture)
+def check(module_dir: Path, cloud: str, architecture: str, images: dict | None = None) -> None:
+    violations = find_violations(module_dir, cloud, architecture, images)
     if violations:
         raise IacError(violations)
     print(f"[iac] OK ({cloud}/{architecture})", flush=True)
 
 
-def find_violations(module_dir: Path, cloud: str, architecture: str) -> list[str]:
+def find_violations(module_dir: Path, cloud: str, architecture: str, images: dict | None = None) -> list[str]:
     v: list[str] = []
     files = sorted(p for p in module_dir.iterdir()) if module_dir.is_dir() else []
     for p in files:
@@ -63,7 +82,34 @@ def find_violations(module_dir: Path, cloud: str, architecture: str) -> list[str
     code = "\n".join(p.read_text(encoding="utf-8") for p in files if p.suffix == ".tf" and p.is_file())
     if not code.strip():
         return v + ["Terraform 파일(.tf)이 없습니다"]
+    for p in files:
+        if p.suffix == ".tftpl" and p.is_file():
+            v += check_template(p.name, p.read_text(encoding="utf-8"))
+    if architecture == "ec2_compose":
+        template = module_dir / COMPOSE_TEMPLATE
+        if not template.is_file():
+            v.append(f"ec2_compose 모듈에는 {COMPOSE_TEMPLATE} 가 있어야 함")
+        elif images is not None:
+            v += check_template_images(template.read_text(encoding="utf-8"), images)
     return v + check_code(code, cloud, architecture)
+
+
+def check_template_images(text: str, images: dict) -> list[str]:
+    """compose.yaml.tftpl 이 쓰는 images["<id>"] 가 작업 입력 images 에 모두 있는지 (없으면 plan 에서 알기 어려운 오류)."""
+    used = set(IMAGE_REF_RE.findall(text))
+    unused = sorted(set(images) - used)
+    if unused:
+        print(f"[iac] 템플릿에서 쓰지 않는 이미지: {unused}", flush=True)
+    return [f"{COMPOSE_TEMPLATE}: images[\"{i}\"] 가 작업 입력 images 에 없음 (있는 것: {sorted(images)})"
+            for i in sorted(used - set(images))]
+
+
+def check_template(name: str, text: str) -> list[str]:
+    """templatefile() 로 읽는 .tftpl 검사: 템플릿 안의 함수 호출로 워커 파일을 읽는 것 + compose 의 호스트 권한."""
+    v = [f"{name}: 템플릿 안에서 {func}() 로 파일을 읽을 수 없음" for func in TEMPLATE_FILE_FUNC_RE.findall(text)]
+    if name == COMPOSE_TEMPLATE:
+        v += [f"{name}: 허용하지 않는 compose 설정: {why}" for pattern, why in COMPOSE_FORBIDDEN if re.search(pattern, text)]
+    return v
 
 
 def check_code(code: str, cloud: str, architecture: str) -> list[str]:
@@ -75,9 +121,10 @@ def check_code(code: str, cloud: str, architecture: str) -> list[str]:
             v.append(f'{attr} 에 문자열("{literal}")을 직접 쓸 수 없음 — 이 모듈에서 만든 리소스를 참조할 것 '
                      f"(이미 있는 역할·계정 재사용 금지)")
 
+    sources = PROVIDER_SOURCES[cloud] | ARCHITECTURE_PROVIDER_SOURCES.get(architecture, set())
     for src in re.findall(r'\bsource\s*=\s*"([^"]+)"', code):
-        if src != PROVIDER_SOURCES[cloud]:
-            v.append(f"허용하지 않는 provider source: {src} (가능: {PROVIDER_SOURCES[cloud]})")
+        if src not in sources:
+            v.append(f"허용하지 않는 provider source: {src} (가능: {sorted(sources)})")
 
     allowed = policy.ALLOWED_TYPES.get(architecture, set())
     for rtype in sorted(set(re.findall(r'\bresource\s+"([A-Za-z0-9_]+)"', code)) - allowed):
@@ -94,7 +141,7 @@ def check_code(code: str, cloud: str, architecture: str) -> list[str]:
         if not MODULE_PATH_ARG_RE.match(arg) or ".." in arg:
             v.append(f'{func}() 는 "${{path.module}}/파일" 형태로 모듈 안의 파일만 읽을 수 있음: {arg or "(없음)"}')
 
-    for name in CONTRACT_VARIABLES:
+    for name in COMPOSE_CONTRACT_VARIABLES if architecture == "ec2_compose" else CONTRACT_VARIABLES:
         if not re.search(rf'\bvariable\s+"{name}"', code):
             v.append(f"입력 변수 누락: {name}")
     for name in CONTRACT_OUTPUTS:
@@ -104,7 +151,7 @@ def check_code(code: str, cloud: str, architecture: str) -> list[str]:
     for arn in re.findall(r'\bpolicy_arn\s*=\s*"([^"]+)"', code):
         if arn not in policy.ALLOWED_POLICY_ARNS:
             v.append(f"허용하지 않는 IAM 정책: {arn}")
-    if architecture == "ec2" and not re.search(r'\bcpu_credits\s*=\s*"standard"', code):
+    if architecture in ("ec2", "ec2_compose") and not re.search(r'\bcpu_credits\s*=\s*"standard"', code):
         v.append('EC2 는 cpu_credits = "standard" 를 유지해야 함 (추가 과금 방지)')
     if architecture == "cloud_run" and not re.search(r"\bdeletion_protection\s*=\s*false\b", code):
         v.append("Cloud Run 은 deletion_protection = false 여야 함 (켜져 있으면 1시간 뒤 destroy 가 실패)")
