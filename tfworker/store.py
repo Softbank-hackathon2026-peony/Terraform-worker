@@ -14,14 +14,22 @@ Main Server 가 배포 상태를 읽어 화면에 보여 주고, `sweep` 이 다
 잠금이 필요한 이유: SQS 는 같은 메시지를 두 번 줄 수 있고, sweep·사용자 종료·재시도가 겹칠 수 있다.
 워커가 여러 대이면 로컬 result.json 만으로는 "이미 진행 중"을 알 수 없으므로 조건부 쓰기로 한 번에 하나만 돌게 한다.
 워커가 중간에 죽어도 잠금은 PAWPLOY_LOCK_LEASE_SEC(기본 3600초) 뒤에 풀린다.
+
+호출 방식: 상태가 바뀔 때마다 기록하므로 배포 한 건에 DynamoDB 호출이 20번 가까이 된다. aws CLI 는 호출마다
+새 프로세스라 Fargate(0.5 vCPU)에서 한 번에 약 1.8초가 걸려, boto3 가 있으면 클라이언트를 한 번 만들어 재사용한다.
+AWS_BIN 을 지정했거나(테스트의 가짜 CLI) boto3 가 없으면(로컬) 예전처럼 aws CLI 로 부른다.
 """
+import importlib.util
 import json
 import os
+import re
 import time
 
 from . import awscli
 
 LOCK_LEASE_SEC = int(os.environ.get("PAWPLOY_LOCK_LEASE_SEC") or 3600)
+HAS_BOTO3 = importlib.util.find_spec("boto3") is not None
+_clients: dict[str, object] = {}   # 리전별 boto3 DynamoDB 클라이언트 (재사용)
 
 # 리소스가 남아 있지 않다고 보는 상태 (render.REUSABLE_STATUSES 와 같은 기준)
 FINISHED_STATUSES = ("destroyed", "failed")
@@ -44,9 +52,8 @@ def put(result: dict, job: dict) -> None:
         return
     item = {**result, "project_id": job["project_id"]}
     try:
-        awscli.run("dynamodb", "put-item", "--table-name", table(),
-                   "--item", json.dumps(to_attr(item)["M"], ensure_ascii=False),
-                   region=_region())   # 상태 테이블은 한 곳(서울). 배포 리전(GCP 는 asia-northeast3 등)과 무관
+        # 상태 테이블은 한 곳(서울). 배포 리전(GCP 는 asia-northeast3 등)과 무관
+        _call("PutItem", _region(), TableName=table(), Item=to_attr(item)["M"])
     except awscli.AwsError as e:
         print(f"[store] DynamoDB 기록 실패 (계속 진행): {e}", flush=True)
 
@@ -55,16 +62,60 @@ def _region() -> str:
     return region(os.environ.get("PAWPLOY_REGION", "ap-northeast-2"))
 
 
-def _key(deploy_id: str) -> str:
-    return json.dumps({"deploy_id": {"S": deploy_id}})
+def _key(deploy_id: str) -> dict:
+    return {"deploy_id": {"S": deploy_id}}
+
+
+def _use_sdk() -> bool:
+    return HAS_BOTO3 and not os.environ.get("AWS_BIN")
+
+
+def _sdk_errors() -> tuple:
+    from botocore.exceptions import BotoCoreError, ClientError
+    return BotoCoreError, ClientError
+
+
+def _sdk_client(region_name: str):
+    if region_name not in _clients:
+        import boto3
+        _clients[region_name] = boto3.client("dynamodb", region_name=region_name)
+    return _clients[region_name]
+
+
+def _call(op: str, region_name: str, **params) -> dict:
+    """DynamoDB API 를 부른다. op 는 API 이름(PutItem), params 는 API 파라미터 이름·값(AttributeValue 형식) 그대로.
+
+    실패는 어느 방식이든 awscli.AwsError (조건 불일치면 메시지에 ConditionalCheckFailed 포함).
+    """
+    snake = re.sub(r"(?<!^)(?=[A-Z])", "_", op).lower()   # PutItem → put_item
+    if _use_sdk():
+        print(f"[aws] dynamodb {snake} (sdk)", flush=True)
+        try:
+            client = _sdk_client(region_name)
+            if op != "Scan":
+                return getattr(client, snake)(**params)
+            items = []   # CLI 는 페이지를 알아서 이어 붙이지만 SDK 는 직접 해야 한다
+            for page in client.get_paginator("scan").paginate(**params):
+                items += page.get("Items") or []
+            return {"Items": items}
+        except _sdk_errors() as e:
+            raise awscli.AwsError(f"dynamodb {snake} 실패: {e}") from None
+
+    args = []
+    for name, value in params.items():
+        flag = "--" + re.sub(r"(?<!^)(?=[A-Z])", "-", name).lower()   # TableName → --table-name
+        if value is True:
+            args.append(flag)
+        else:
+            args += [flag, value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)]
+    return awscli.run("dynamodb", snake.replace("_", "-"), *args, region=region_name)
 
 
 def get(deploy_id: str) -> dict | None:
     """DynamoDB 의 배포 결과 (다른 워커가 쓴 것 포함). 테이블이 없으면 None. 조회 실패는 AwsError."""
     if not table() or awscli.offline():
         return None
-    out = awscli.run("dynamodb", "get-item", "--table-name", table(), "--key", _key(deploy_id),
-                     "--consistent-read", region=_region())
+    out = _call("GetItem", _region(), TableName=table(), Key=_key(deploy_id), ConsistentRead=True)
     return from_attr({"M": out["Item"]}) if out.get("Item") else None
 
 
@@ -76,9 +127,9 @@ def acquire_lock(deploy_id: str, owner: str) -> bool:
     item = {"deploy_id": {"S": f"lock#{deploy_id}"}, "kind": {"S": "lock"}, "owner": {"S": owner},
             "lease_until": {"N": str(now + LOCK_LEASE_SEC)}}
     try:
-        awscli.run("dynamodb", "put-item", "--table-name", table(), "--item", json.dumps(item),
-                   "--condition-expression", "attribute_not_exists(deploy_id) OR lease_until < :now",
-                   "--expression-attribute-values", json.dumps({":now": {"N": str(now)}}), region=_region())
+        _call("PutItem", _region(), TableName=table(), Item=item,
+              ConditionExpression="attribute_not_exists(deploy_id) OR lease_until < :now",
+              ExpressionAttributeValues={":now": {"N": str(now)}})
         return True
     except awscli.AwsError as e:
         if "ConditionalCheckFailed" in str(e):
@@ -91,10 +142,9 @@ def release_lock(deploy_id: str, owner: str) -> None:
     if not table() or awscli.offline():
         return
     try:
-        awscli.run("dynamodb", "delete-item", "--table-name", table(), "--key", _key(f"lock#{deploy_id}"),
-                   "--condition-expression", "#o = :me",
-                   "--expression-attribute-names", json.dumps({"#o": "owner"}),
-                   "--expression-attribute-values", json.dumps({":me": {"S": owner}}), region=_region())
+        _call("DeleteItem", _region(), TableName=table(), Key=_key(f"lock#{deploy_id}"),
+              ConditionExpression="#o = :me", ExpressionAttributeNames={"#o": "owner"},
+              ExpressionAttributeValues={":me": {"S": owner}})
     except awscli.AwsError as e:
         print(f"[store] 잠금 해제 실패 (임대 시간 뒤 자동 해제): {e}", flush=True)
 
@@ -103,16 +153,15 @@ def list_expired(now_iso: str, default_region: str) -> list[dict]:
     """만료 시각이 지났고 아직 끝나지 않은 배포 항목들 (sweep 용). 테이블이 없으면 빈 목록."""
     if not table() or awscli.offline():
         return []
-    out = awscli.run(
-        "dynamodb", "scan", "--table-name", table(),
-        "--filter-expression", "expires_at <= :now AND NOT (#s IN (:destroyed, :failed))",
-        "--expression-attribute-names", json.dumps({"#s": "status"}),
-        "--expression-attribute-values", json.dumps({
+    out = _call(
+        "Scan", region(default_region), TableName=table(),
+        FilterExpression="expires_at <= :now AND NOT (#s IN (:destroyed, :failed))",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={
             ":now": {"S": now_iso},
             ":destroyed": {"S": FINISHED_STATUSES[0]},
             ":failed": {"S": FINISHED_STATUSES[1]},
-        }),
-        region=region(default_region))
+        })
     return [from_attr({"M": item}) for item in out.get("Items") or []]
 
 

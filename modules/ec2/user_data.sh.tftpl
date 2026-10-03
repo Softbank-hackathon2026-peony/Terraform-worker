@@ -4,7 +4,8 @@ set -euo pipefail
 exec > >(tee -a /var/log/pawploy-bootstrap.log) 2>&1
 echo "[pawploy] start $(date -Is)"
 
-dnf install -y docker
+# Docker 는 AMI 에 들어 있음. ECS 에이전트는 쓰지 않으므로 끈다 (클러스터 등록 시도 방지)
+systemctl disable --now ecs >/dev/null 2>&1 || true
 systemctl enable --now docker
 
 %{ if ecr_region != "" ~}

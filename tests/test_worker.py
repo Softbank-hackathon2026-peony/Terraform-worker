@@ -16,6 +16,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 FAKE_TF = ROOT / "tools" / "fake-terraform.py"
@@ -363,6 +364,19 @@ class WorkerFlowTest(unittest.TestCase):
             self.assertTrue(t["terraform_source"].endswith(f"/attempt-2/{cloud}/"), t["terraform_source"])
             saved = json.loads((self.tdir(cloud, "dep-multi") / "job.json").read_text(encoding="utf-8"))
             self.assertEqual(saved["architecture"], arch, "destroy 도 같은 아키텍처로 처리하도록 job.json 에 기록")
+
+    def test_exact_terraform_uri_skips_s3_listing(self):
+        """terraform_uri 가 attempt-N/<cloud>/ 를 정확히 가리키면 S3 목록 조회 없이 그대로 쓴다."""
+        deploy_dir = self.tmp / "s3" / "agentbkt" / "projects" / "prj_test" / "deploy" / "dep-multi"
+        shutil.copytree(self.module_dir("lambda"), deploy_dir / "attempt-1" / "aws")
+        uri = "s3://agentbkt/projects/prj_test/deploy/dep-multi/attempt-1/aws/"
+        env = self.aws_env(FAKE_AWS_S3_ROOT=str(self.tmp / "s3"))
+        job = self.write_targets([{"cloud": "aws", "image_uri": AWS_IMAGE, "terraform_uri": uri}])
+        code, out = self.run_worker("deploy", job, **env)
+        self.assertEqual(code, 0, out)
+        t = self.target("aws", "dep-multi")
+        self.assertEqual((t["terraform_source"], t["architecture"]), (uri, "lambda"))
+        self.assertEqual(self.aws_calls("s3api", "list-objects-v2"), [])
 
     def test_agentcore_module_architecture_mismatch_is_reported(self):
         deploy_dir = self.tmp / "s3" / "agentbkt" / "projects" / "prj_test" / "deploy" / "dep-test-ec2"
@@ -1025,6 +1039,60 @@ resource "aws_s3_bucket" "b" {}
         value = {"s": "x", "n": 3, "f": 1.5, "b": True, "none": None, "l": [1, "a"], "m": {"k": "v"}}
         self.assertEqual(store.from_attr(store.to_attr(value)), value)
         self.assertEqual(store.to_attr(True), {"BOOL": True}, "bool 이 숫자로 저장되면 안 됨")
+
+    def test_store_uses_reused_sdk_client_when_boto3_is_available(self):
+        """boto3 가 있으면(운영 이미지) CLI 대신 클라이언트 하나를 재사용하고, 잠금·기록·scan 결과는 CLI 와 같아야 한다."""
+        sys.path.insert(0, str(ROOT))
+        from tfworker import awscli, store
+
+        class FakeClientError(Exception):
+            pass
+
+        class FakeDynamoDB:
+            def __init__(self):
+                self.items, self.calls = {}, []
+
+            def put_item(self, TableName, Item, ConditionExpression=None, ExpressionAttributeValues=None):
+                self.calls.append("put_item")
+                old = self.items.get(Item["deploy_id"]["S"])
+                if ConditionExpression and old and not int(old["lease_until"]["N"]) < int(
+                        ExpressionAttributeValues[":now"]["N"]):
+                    raise FakeClientError("An error occurred (ConditionalCheckFailedException) when calling PutItem")
+                self.items[Item["deploy_id"]["S"]] = Item
+                return {}
+
+            def get_item(self, TableName, Key, ConsistentRead):
+                self.calls.append("get_item")
+                item = self.items.get(Key["deploy_id"]["S"])
+                return {"Item": item} if item else {}
+
+            def delete_item(self, TableName, Key, ConditionExpression, ExpressionAttributeNames,
+                            ExpressionAttributeValues):
+                self.calls.append("delete_item")
+                if self.items.get(Key["deploy_id"]["S"], {}).get("owner") == ExpressionAttributeValues[":me"]:
+                    del self.items[Key["deploy_id"]["S"]]
+                return {}
+
+            def get_paginator(self, name):
+                pages = [{"Items": [store.to_attr({"deploy_id": "a"})["M"]]},
+                         {"Items": [store.to_attr({"deploy_id": "b"})["M"]]}]
+                return type("P", (), {"paginate": lambda _self, **kw: iter(pages)})()
+
+        fake = FakeDynamoDB()
+        env = {"PAWPLOY_STATUS_TABLE": "t", "PAWPLOY_OFFLINE": "", "AWS_BIN": ""}
+        with mock.patch.dict(os.environ, env), mock.patch.object(store, "HAS_BOTO3", True), \
+                mock.patch.object(store, "_clients", {"ap-northeast-2": fake}), \
+                mock.patch.object(store, "_sdk_errors", lambda: (FakeClientError,)), \
+                mock.patch.object(awscli, "run", side_effect=AssertionError("CLI 를 부르면 안 됨")):
+            self.assertTrue(store.acquire_lock("dep-x", "me"))
+            self.assertFalse(store.acquire_lock("dep-x", "other"), "조건 불일치 → 다른 작업이 잡고 있음")
+            store.put({"deploy_id": "dep-x", "status": "running", "targets": {}}, {"project_id": "p"})
+            self.assertEqual(store.get("dep-x")["status"], "running")
+            store.release_lock("dep-x", "me")
+            self.assertNotIn("lock#dep-x", fake.items)
+            self.assertEqual([r["deploy_id"] for r in store.list_expired("2026-01-01T00:00:00Z", "ap-northeast-2")],
+                             ["a", "b"], "scan 은 모든 페이지를 이어 붙여야 함")
+        self.assertEqual(fake.calls, ["put_item", "put_item", "put_item", "get_item", "delete_item"])
 
     def test_s3_backend_args_include_lockfile_and_cloud(self):
         sys.path.insert(0, str(ROOT))

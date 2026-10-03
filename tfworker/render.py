@@ -252,11 +252,14 @@ def module_uri(tjob: dict) -> str | None:
       - terraform_uri 가 attempt-N 상위 폴더(attempt-* 를 담은 폴더)면 그 안에서 찾는다
       - N 이 가장 큰 attempt 를 쓴다 (숫자 비교: attempt-10 > attempt-9). 수정본(23~25)이 N+1 로 올라온다
       - attempt-N/<cloud>/ 폴더가 있으면 그 폴더(멀티 클라우드), 없으면 attempt-N/ 자체
+      - terraform_uri 가 이미 <cloud>/ 폴더를 가리키면 S3 목록을 조회하지 않고 그대로 쓴다 (조회 1회 약 1.8초)
     """
     uri = tjob.get("terraform_uri")
     bucket = os.environ.get("PAWPLOY_AGENT_BUCKET")
     if not uri and not bucket:
         return None
+    if uri and uri.startswith("s3://") and uri.endswith(f"/{tjob['cloud']}/"):
+        return uri
     if not uri:
         uri = f"s3://{bucket}/projects/{tjob['project_id']}/deploy/{tjob['deploy_id']}/"
     if uri.startswith("s3://") and not ATTEMPT_RE.search(uri):
