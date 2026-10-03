@@ -25,6 +25,9 @@ RUN apt-get update \
  && rm -rf /tmp/* /var/lib/apt/lists/* \
  && terraform -version && aws --version
 
+# DynamoDB 상태 기록용 (store.py). 호출마다 aws CLI 프로세스를 띄우면 약 1.8초라 클라이언트를 재사용한다
+RUN pip install --no-cache-dir boto3==1.43.108
+
 RUN useradd --create-home --uid 10001 worker && mkdir -p /work && chown worker /work
 WORKDIR /app
 COPY tfworker/ tfworker/
